@@ -1,0 +1,96 @@
+{
+  "docs": [
+    {
+      "id": "validate_jwt",
+      "path": "src/auth/jwt.rs",
+      "text": "pub fn validate_jwt(token: &str, key: &JwtKey) -> Result<Claims, AuthError>. Validates signature and exp claim of a JWT. Returns Claims on success."
+    },
+    {
+      "id": "JwtKey",
+      "path": "src/auth/jwt.rs",
+      "text": "pub struct JwtKey { kid: String, bytes: Vec<u8> }. HMAC signing key used by validate_jwt to verify token signatures."
+    },
+    {
+      "id": "Claims",
+      "path": "src/auth/types.rs",
+      "text": "pub struct Claims { sub: String, exp: u64, scope: Vec<String> }. Decoded JWT payload produced by validate_jwt after expiry check."
+    },
+    {
+      "id": "refresh_token",
+      "path": "src/auth/session.rs",
+      "text": "pub fn refresh_token(session: &Session, store: &mut SessionStore) -> Result<Token, AuthError>. Rotates refresh tokens after validating session expiry."
+    },
+    {
+      "id": "SessionStore",
+      "path": "src/auth/session.rs",
+      "text": "pub struct SessionStore { map: HashMap<String, Session> }. Persists sessions backing refresh_token rotation and lookup."
+    },
+    {
+      "id": "login_handler",
+      "path": "src/api/login.rs",
+      "text": "pub async fn login_handler(db: &Db, creds: Credentials) -> Response. Verifies password hash against stored credential and issues an access token."
+    },
+    {
+      "id": "hash_password",
+      "path": "src/security/password.rs",
+      "text": "pub fn hash_password(pw: &str) -> String. Argon2 hashing for credential storage; verified during login_handler authentication."
+    },
+    {
+      "id": "ConfigError",
+      "path": "src/config/mod.rs",
+      "text": "pub enum ConfigError { Missing, Parse }. Raised when config file loading or parsing fails."
+    },
+    {
+      "id": "parse_requirements",
+      "path": "scripts/deps.py",
+      "text": "def parse_requirements(path): Reads requirements.txt into a list of pinned package versions."
+    },
+    {
+      "id": "migrate_db",
+      "path": "db/migrate.py",
+      "text": "def migrate_db(conn): Applies pending schema migrations inside a single transaction with rollback on failure."
+    },
+    {
+      "id": "retry_with_backoff",
+      "path": "utils/http.py",
+      "text": "def retry_with_backoff(fn, attempts=5): Retries flaky HTTP requests with exponential backoff and jitter between attempts."
+    },
+    {
+      "id": "render_invoice",
+      "path": "billing/invoice.py",
+      "text": "def render_invoice(order): Renders PDF invoice including tax breakdown and totals for the order."
+    }
+  ],
+  "queries": [
+    {
+      "id": "q1",
+      "text": "validate jwt token expiry before issuing claims",
+      "gold": ["validate_jwt", "Claims", "JwtKey"]
+    },
+    {
+      "id": "q2",
+      "text": "rotate expired refresh token sessions safely",
+      "gold": ["refresh_token", "SessionStore"]
+    },
+    {
+      "id": "q3",
+      "text": "hash user password during login verification",
+      "gold": ["hash_password", "login_handler"]
+    },
+    {
+      "id": "q4",
+      "text": "apply database schema migrations in transaction",
+      "gold": ["migrate_db"]
+    },
+    {
+      "id": "q5",
+      "text": "retry failing http requests with exponential backoff",
+      "gold": ["retry_with_backoff"]
+    },
+    {
+      "id": "q6",
+      "text": "config file loading error handling",
+      "gold": ["ConfigError"]
+    }
+  ]
+}

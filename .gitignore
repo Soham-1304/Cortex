@@ -1,0 +1,46 @@
+# Build & targets
+target/
+Cargo.lock.bak
+*.db
+*.db-wal
+*.db-shm
+
+# System & IDE files
+.DS_Store
+.worktrees/
+.opencode/
+.vscode/
+.idea/
+
+# Cortex runtime & local state
+.cortex/
+CORTEX.md
+
+# Internal documentation, research, and planning notes
+Architecture.md
+BENCH_LOG_*.md
+CHECKPOINT.md
+GAK_CRRF_PLAN.md
+HANDOFF_*.md
+LIT_REVIEW.md
+MASTER_PLAN.md
+METRICS.md
+VALIDATION.md
+session-*.md
+docs/
+plans/
+
+# Benchmark artifacts & caches
+bench/BENCH_RESULTS.md
+bench/REAL_FIX_PLAN.md
+bench/results/
+bench/fixtures/contextbench_*/repos/
+bench/fixtures/contextbench_*/corpus_raw.json
+bench/fixtures/contextbench_*/embed_cache_*.json
+bench/fixtures/contextbench_*/tasks.jsonl
+bench/fixtures/ts_*/
+bench/scripts/__pycache__/
+*.pyc
+
+# Misc temporary files
+package-lock.json
