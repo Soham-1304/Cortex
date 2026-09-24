@@ -85,6 +85,9 @@ pub fn run_llm_harness(cfg: &LlmConfig) -> crate::Result<LlmHarnessReport> {
     if cfg.limit > 0 && (base.tasks as usize) > cfg.limit { base.tasks = cfg.limit; }
     let project = generate(base.docs, base.tasks as usize, base.seed, base.distractors)?;
     let store = Store::open_in_memory()?;
+    // Harness convention: hash-64 for synthetic docs (no real semantics in
+    // generated token soup; both arms share this store, so A/B stays fair).
+    // Real-embedding retrieval is measured by the bench harness, not here.
     let emb = HashEmbedder::new(64);
     let seed_tokens_total = seed_memory(&store, &project, &emb)?;
     let core = CoreFile { path: "eval".into(), preamble: None, sections: Default::default() };

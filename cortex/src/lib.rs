@@ -25,3 +25,12 @@ pub enum Error {
     Cli(String),
 }
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// Unix seconds (std-only, saturates to 0 before the epoch — never fails,
+/// so report tagging can't break a harness run).
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}

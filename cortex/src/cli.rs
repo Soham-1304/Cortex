@@ -607,7 +607,10 @@ fn do_recall(task: String, budget: i64, json: bool) -> Result<()> {
     let cp = core_path(&base);
     let store = Store::open_at(&db_path)?;
     let core = CoreFile::load(&cp).unwrap_or_else(|_| CoreFile { path: cp.clone(), preamble: None, sections: Default::default() });
-    let provider: Box<dyn EmbeddingProvider> = crate::embed::registry::load_for_base(&base).unwrap_or_else(|_| Box::new(HashEmbedder::new(64)));
+    let provider: Box<dyn EmbeddingProvider> = crate::embed::registry::load_for_base(&base).unwrap_or_else(|e| {
+        eprintln!("warning: embedding config load failed ({e}); falling back to hash-64 for recall — reindex after fixing config");
+        Box::new(HashEmbedder::new(64))
+    });
     if let Err(e) = provider.health_check() {
         if provider.name() != "hash" && provider.name() != "noop" {
             return Err(crate::Error::Cli(format!("embedding provider {} unhealthy: {} (hint: run cortex reindex or check config)", provider.name(), e)));
@@ -1289,7 +1292,10 @@ fn do_index(path: String, embed: String) -> Result<()> {
         let cfg = EmbeddingConfig { provider: embed.clone(), dim, model, ollama_url, api_key_env };
         crate::embed::registry::from_config(&cfg)?
     } else {
-        crate::embed::registry::load_for_base(&base).unwrap_or_else(|_| Box::new(HashEmbedder::new(64)))
+        crate::embed::registry::load_for_base(&base).unwrap_or_else(|e| {
+            eprintln!("warning: embedding config load failed ({e}); falling back to hash-64 — reindex after fixing config");
+            Box::new(HashEmbedder::new(64))
+        })
     };
     if let Err(e) = provider.health_check() {
         if provider.name() != "hash" && provider.name() != "noop" {
@@ -1389,7 +1395,10 @@ fn do_reindex(embed: Option<String>) -> Result<()> {
         let cfg = EmbeddingConfig { provider: e.clone(), dim, model, ollama_url, api_key_env };
         crate::embed::registry::from_config(&cfg)?
     } else {
-        crate::embed::registry::load_for_base(&base).unwrap_or_else(|_| Box::new(HashEmbedder::new(64)))
+        crate::embed::registry::load_for_base(&base).unwrap_or_else(|e| {
+            eprintln!("warning: embedding config load failed ({e}); falling back to hash-64 — reindex after fixing config");
+            Box::new(HashEmbedder::new(64))
+        })
     };
     provider.health_check()?;
     let mut note_rows: Vec<(i64, String)> = Vec::new();

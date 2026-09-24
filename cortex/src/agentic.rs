@@ -420,6 +420,9 @@ pub struct ArmSummary {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct HarnessReport {
+    pub generated_at_unix: u64,
+    pub harness_version: String,
+    pub embed: String,
     pub docs: usize,
     pub tasks: usize,
     pub seed: u64,
@@ -508,6 +511,7 @@ pub fn run_harness(cfg: &HarnessConfig) -> Result<HarnessReport> {
 
     // ---- Cortex arm: seed memory once (previous-session knowledge) ----
     let store = Store::open_in_memory()?;
+    // Harness convention: hash-64 for synthetic docs (see agentic_llm.rs).
     let emb = HashEmbedder::new(64);
     let seed_tokens_total = seed_memory(&store, &project, &emb)?;
     let core = CoreFile {
@@ -555,6 +559,9 @@ pub fn run_harness(cfg: &HarnessConfig) -> Result<HarnessReport> {
     let seed_amortized = seed_tokens_total as f64 / n;
 
     Ok(HarnessReport {
+        generated_at_unix: crate::unix_now(),
+        harness_version: env!("CARGO_PKG_VERSION").to_string(),
+        embed: "hash-64 synthetic".to_string(),
         docs: cfg.docs,
         tasks: cfg.tasks,
         seed: cfg.seed,
@@ -580,6 +587,10 @@ pub fn run_harness(cfg: &HarnessConfig) -> Result<HarnessReport> {
 /// Human-readable report (mirrors bench/src/main.rs report style).
 pub fn print_report(r: &HarnessReport) {
     println!("=== cortex eval — agentic loop A/B (seed {}) ===", r.seed);
+    println!(
+        "provenance: t={} version={} embed={}",
+        r.generated_at_unix, r.harness_version, r.embed
+    );
     println!(
         "docs={} tasks={} budget={} per_turn={} max_turns={} distractors={}",
         r.docs, r.tasks, r.budget, r.per_turn, r.max_turns, r.distractors

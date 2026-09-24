@@ -153,7 +153,10 @@ fn dispatch(name: &str, args: &Value, id: Value) -> Value {
                 let cp = core_path();
                 let core = CoreFile::load(&cp).unwrap_or_else(|_| CoreFile { path: cp.clone(), preamble: None, sections: Default::default() });
                 let base = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-                let provider: Box<dyn crate::embed::EmbeddingProvider> = crate::embed::registry::load_for_base(&base).unwrap_or_else(|_| Box::new(HashEmbedder::new(64)));
+                let provider: Box<dyn crate::embed::EmbeddingProvider> = crate::embed::registry::load_for_base(&base).unwrap_or_else(|e| {
+                    eprintln!("warning: embedding config load failed ({e}); falling back to hash-64 — reindex after fixing config");
+                    Box::new(HashEmbedder::new(64))
+                });
                 if let Some(db_dim) = store.get_meta("embedding_dim").map_err(|e| e.to_string())? {
                     if db_dim != provider.dim().to_string() {
                         return Err(format!("embedding dim mismatch (db={}, config={}): run cortex reindex", db_dim, provider.dim()));
@@ -252,7 +255,10 @@ fn dispatch(name: &str, args: &Value, id: Value) -> Value {
                     let cfg = crate::config::EmbeddingConfig { provider: e.clone(), dim, model, ollama_url: None, api_key_env: None };
                     crate::embed::registry::from_config(&cfg).map_err(|e| e.to_string())?
                 } else {
-                    crate::embed::registry::load_for_base(&base).unwrap_or_else(|_| Box::new(HashEmbedder::new(64)))
+                    crate::embed::registry::load_for_base(&base).unwrap_or_else(|e| {
+                        eprintln!("warning: embedding config load failed ({e}); falling back to hash-64 — reindex after fixing config");
+                        Box::new(HashEmbedder::new(64))
+                    })
                 };
                 provider.health_check().map_err(|e| e.to_string())?;
                 let mut note_rows: Vec<(i64, String)> = Vec::new();

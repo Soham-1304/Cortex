@@ -21,6 +21,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 CORTEX = os.environ.get(
     "CORTEX_BIN",
@@ -62,10 +63,35 @@ def score(payload, task):
     return span_hit, file_hit, len(syms)
 
 
+def provenance(workdir):
+    """Best-effort run tags: timestamp, binary identity, cortex version."""
+    try:
+        r = subprocess.run(
+            [CORTEX, "--version"], capture_output=True, text=True, timeout=30,
+        )
+        raw = (r.stdout.strip() or r.stderr.strip() or "unknown").splitlines()[0]
+        # clap version goes through our Error::Cli wrapper ("error: cli: ...").
+        ver = raw.removeprefix("error: cli: ").strip() or "unknown"
+    except Exception:
+        ver = "unknown"
+    try:
+        st = os.stat(CORTEX)
+        binary = {"path": CORTEX, "mtime": int(st.st_mtime), "size": st.st_size}
+    except Exception:
+        binary = {"path": CORTEX}
+    return {
+        "generated_at_unix": int(time.time()),
+        "cortex_version": ver,
+        "binary": binary,
+        "budget": 2000,
+        "work_dir": workdir,
+    }
+
+
 def main():
     fixdir, workdir, outpath = sys.argv[1], sys.argv[2], sys.argv[3]
     tasks = [json.loads(l) for l in open(f"{fixdir}/tasks.jsonl") if l.strip()]
-    results = {}
+    results = {"provenance": provenance(workdir), "fixtures_dir": fixdir}
     for refs_on in (True, False):
         tag = "refs_on" if refs_on else "refs_off"
         span_hits = 0

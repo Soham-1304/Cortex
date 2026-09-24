@@ -83,6 +83,11 @@ struct Aggregate {
 
 #[derive(Serialize)]
 struct JsonOut {
+    generated_at_unix: u64,
+    harness_version: String,
+    provider: String,
+    fuse: String,
+    pool_top: usize,
     docs: usize,
     queries: usize,
     budget: i64,
@@ -101,6 +106,14 @@ fn mean(v: &[f64]) -> f64 {
     } else {
         v.iter().sum::<f64>() / v.len() as f64
     }
+}
+
+/// Unix seconds (std-only; never fails so tagging can't break a run).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn report(name: &str, vals: &[f64], extra: &str) {
@@ -546,6 +559,7 @@ fn main() {
         }
     }
     eprintln!("[bench] embed provider: {} dim={} | fuse: {}", provider.name(), provider.dim(), fuse_flag);
+    eprintln!("[bench] provenance: t={} version={}", unix_now(), env!("CARGO_PKG_VERSION"));
 
     let corpus = if fixtures.join("tasks.jsonl").exists() {
         bench::contextbench::load_dir(&fixtures).expect("failed to load contextbench export")
@@ -621,6 +635,11 @@ fn main() {
 
         if json_out {
             outs.push(JsonOut {
+                generated_at_unix: unix_now(),
+                harness_version: env!("CARGO_PKG_VERSION").to_string(),
+                provider: provider.name().to_string(),
+                fuse: fuse_flag.clone(),
+                pool_top,
                 docs: corpus.docs.len(),
                 queries: corpus.queries.len(),
                 budget,
