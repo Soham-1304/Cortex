@@ -79,6 +79,11 @@ enum Cmd {
         path: String,
         #[arg(long, default_value="hash")]
         embed: String,
+        /// Repeatable substring filter on repo-relative paths (files AND
+        /// dirs). E.g. --exclude fixtures --exclude vendor. Skipped paths
+        /// never enter the symbol index or the code-reference graph.
+        #[arg(long)]
+        exclude: Vec<String>,
     },
     Reindex {
         #[arg(long)]
@@ -176,7 +181,7 @@ pub fn run(argv: Vec<String>) -> Result<()> {
         Cmd::Map { query, json } => do_map(query, json),
         Cmd::Tiers { promote_min, archive_days } => do_tiers(promote_min, archive_days),
         Cmd::Digest { summary, tokens } => do_digest(summary, tokens),
-        Cmd::Index { path, embed } => do_index(path, embed),
+        Cmd::Index { path, embed, exclude } => do_index(path, embed, exclude),
         Cmd::Reindex { embed } => do_reindex(embed),
         Cmd::Core { sub } => match sub {
             CoreCmd::Show => do_core_show(),
@@ -1157,7 +1162,7 @@ fn ignored_by(rel: &str, pats: &[String]) -> bool {
     false
 }
 
-fn extract_symbols(root: &Path) -> (Vec<SymbolRow>, RefIndex) {
+fn extract_symbols(root: &Path, excludes: &[String]) -> (Vec<SymbolRow>, RefIndex) {
     let mut out = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
     let gitignore = load_gitignore(root);
@@ -1180,6 +1185,10 @@ fn extract_symbols(root: &Path) -> (Vec<SymbolRow>, RefIndex) {
                 if fname.starts_with('.') && (fname == ".git" || fname == ".cortex") {
                     continue;
                 }
+                let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().to_string().replace('\\', "/");
+                if excludes.iter().any(|x| !x.is_empty() && rel.contains(x)) {
+                    continue;
+                }
                 stack.push(p);
             } else {
                 let ext = p.extension().and_then(|s| s.to_str()).map(|s| format!(".{s}")).unwrap_or_default();
@@ -1196,6 +1205,9 @@ fn extract_symbols(root: &Path) -> (Vec<SymbolRow>, RefIndex) {
                 }
                 let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().to_string().replace('\\', "/");
                 if ignored_by(&rel, &gitignore) {
+                    continue;
+                }
+                if excludes.iter().any(|x| !x.is_empty() && rel.contains(x)) {
                     continue;
                 }
                 let text = match std::fs::read_to_string(&p) {
@@ -1271,10 +1283,10 @@ struct RefIndex {
 /// Test-only shim: symbol rows without the reference side-map.
 #[cfg(test)]
 fn extract_symbols_vec(root: &Path) -> Vec<SymbolRow> {
-    extract_symbols(root).0
+    extract_symbols(root, &[]).0
 }
 
-fn do_index(path: String, embed: String) -> Result<()> {
+fn do_index(path: String, embed: String, excludes: Vec<String>) -> Result<()> {
     let base = current_base();
     let db_path = store_path(&base);
     let store = Store::open_at(&db_path)?;
@@ -1309,7 +1321,7 @@ fn do_index(path: String, embed: String) -> Result<()> {
     }
     let root = PathBuf::from(&path);
     let root = if root.is_absolute() { root } else { base.join(root) };
-    let (symbols, ref_index) = extract_symbols(&root);
+    let (symbols, ref_index) = extract_symbols(&root, &excludes);
     // Stale sweep: files deleted (or newly skip-listed) since the last
     // index must leave the DB, or recall serves ghosts. Every walked file
     // has a refs entry, so refs keys == the live file set. Dir roots only:
@@ -1645,6 +1657,26 @@ mod tests {
         let syms = extract_symbols_vec(&dir);
         assert!(syms.iter().any(|(_, name, _, _, _, _, _)| name == "bar"), "expected bar symbol, got: {:?}", syms);
         assert!(syms.iter().any(|(_, n, _, _, _, s, e)| n == "bar" && e.len() > s.len() && e.contains("return x + 1")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_exclude_prunes_dirs_and_files() {
+        let _g = LOCK.lock().unwrap();
+        let dir = temp_dir_with_nanos("cx_idx_excl");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("live")).unwrap();
+        std::fs::create_dir_all(dir.join("vendored")).unwrap();
+        std::fs::write(dir.join("live").join("a.py"), "def keep():\n    \"\"\"Kept live symbol for exclude testing.\"\"\"\n    return 1\n").unwrap();
+        std::fs::write(dir.join("vendored").join("b.py"), "def dropme():\n    \"\"\"Vendored symbol that must be excluded.\"\"\"\n    return 2\n").unwrap();
+        std::fs::write(dir.join("skipme.py"), "def alsodrop():\n    \"\"\"Top-level file that must be excluded.\"\"\"\n    return 3\n").unwrap();
+        let all = extract_symbols(&dir, &[]).0;
+        assert!(all.iter().any(|(_, n, ..)| n == "keep"));
+        assert!(all.iter().any(|(_, n, ..)| n == "dropme"));
+        let filtered = extract_symbols(&dir, &["vendored".to_string(), "skipme".to_string()]).0;
+        assert!(filtered.iter().any(|(_, n, ..)| n == "keep"));
+        assert!(filtered.iter().all(|(_, n, ..)| n != "dropme" && n != "alsodrop"),
+            "excluded paths leaked: {:?}", filtered.iter().map(|(_, n, ..)| n).collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
