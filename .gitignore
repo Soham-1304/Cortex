@@ -44,3 +44,10 @@ bench/scripts/__pycache__/
 
 # Misc temporary files
 package-lock.json
+
+# Secrets & machine-local files (never commit)
+.env
+*.env
+*.pem
+*.key
+.envrc

@@ -22,10 +22,15 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
+# Portable default: <repo-root>/target/release/cortex (script lives at
+# <repo-root>/bench/scripts/). Env override always wins — CI and local
+# checkouts set CORTEX_BIN explicitly.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
 CORTEX = os.environ.get(
     "CORTEX_BIN",
-    "/Users/sohamkarandikar/Documents/Cortex/target/release/cortex",
+    str(_REPO_ROOT / "target" / "release" / "cortex"),
 )
 
 
