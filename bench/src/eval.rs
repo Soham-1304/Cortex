@@ -71,6 +71,30 @@ pub fn recall_at_k(ranked: &[String], gold: &[String], k: usize) -> f64 {
     ranked.iter().take(k).filter(|d| g.contains(d)).count() as f64 / gold.len() as f64
 }
 
+/// File-level recall: fraction of gold *files* with at least one symbol doc
+/// in the top-k ranks. The file-first accuracy metric: a query whose gold
+/// file is found can be completed by within-file search, even when the exact
+/// gold span is buried. `id_to_path` maps doc id -> file path.
+pub fn file_recall_at_k(
+    ranked: &[String],
+    id_to_path: &HashMap<String, String>,
+    gold_files: &HashSet<String>,
+    k: usize,
+) -> f64 {
+    if gold_files.is_empty() {
+        return 0.0;
+    }
+    let mut hit = HashSet::new();
+    for id in ranked.iter().take(k) {
+        if let Some(p) = id_to_path.get(id) {
+            if gold_files.contains(p) {
+                hit.insert(p.clone());
+            }
+        }
+    }
+    hit.len() as f64 / gold_files.len() as f64
+}
+
 pub fn mrr(ranked: &[String], gold: &[String]) -> f64 {
     let g: HashSet<&String> = gold.iter().collect();
     for (i, d) in ranked.iter().enumerate() {
@@ -164,6 +188,34 @@ mod tests {
         assert_eq!(recall_at_k(&ranked, &gold, 1), 0.5);
         assert!((mrr(&ranked, &gold) - 1.0).abs() < 1e-12);
         assert_eq!(precision_at_k(&ranked, &gold, 2), 0.5);
+    }
+
+    #[test]
+    fn file_recall_counts_files_not_docs() {
+        use std::collections::{HashMap, HashSet};
+        let id_to_path: HashMap<String, String> = [
+            ("s1", "a.py"),
+            ("s2", "a.py"),
+            ("s3", "b.py"),
+            ("s4", "c.py"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        let gold_files: HashSet<String> =
+            ["a.py".to_string(), "b.py".to_string()].into_iter().collect();
+        // Two a.py docs in top-2 still cover only 1 of 2 gold files.
+        let ranked = vec!["s1".to_string(), "s2".to_string(), "s3".to_string()];
+        assert_eq!(file_recall_at_k(&ranked, &id_to_path, &gold_files, 2), 0.5);
+        assert_eq!(file_recall_at_k(&ranked, &id_to_path, &gold_files, 3), 1.0);
+        // Unknown ids never count; empty gold is 0.
+        let ranked_unknown = vec!["zzz".to_string()];
+        assert_eq!(
+            file_recall_at_k(&ranked_unknown, &id_to_path, &gold_files, 1),
+            0.0
+        );
+        let empty: HashSet<String> = HashSet::new();
+        assert_eq!(file_recall_at_k(&ranked, &id_to_path, &empty, 3), 0.0);
     }
 
     #[test]

@@ -5,6 +5,7 @@ pub mod corpus;
 pub mod embed;
 pub mod eval;
 pub mod fuse;
+pub mod graph;
 pub mod pack;
 pub mod provider;
 pub mod symbols;

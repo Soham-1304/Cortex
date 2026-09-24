@@ -6,10 +6,11 @@ use bench::bm25::Bm25Index;
 use bench::calib::{brier_score, expected_calibration_error, Isotonic};
 use bench::corpus::Corpus;
 use bench::eval::{
-    bcy_at_budget, bootstrap_ci, knee_index, minmax, mrr, ndcg_at_k, recall_at_k,
-    recall_curve, set_precision, set_recall,
+    bcy_at_budget, bootstrap_ci, file_recall_at_k, knee_index, minmax, mrr, ndcg_at_k,
+    recall_at_k, recall_curve, set_precision, set_recall,
 };
 use bench::fuse;
+use bench::graph::file_members;
 use bench::pack::{self, Item};
 use bench::provider::pick_provider;
 
@@ -17,6 +18,10 @@ use bench::provider::pick_provider;
 struct QueryRun {
     ndcg10: f64,
     recall20: f64,
+    file_recall20: f64,
+    ndcg10_pool: f64,
+    recall20_pool: f64,
+    file_recall20_pool: f64,
     mrr: f64,
     packed_precision: f64,
     packed_recall: f64,
@@ -39,6 +44,10 @@ struct QueryRow {
     id: String,
     ndcg10: f64,
     recall20: f64,
+    file_recall20: f64,
+    ndcg10_pool: f64,
+    recall20_pool: f64,
+    file_recall20_pool: f64,
     mrr: f64,
     packed_precision: f64,
     packed_recall: f64,
@@ -56,6 +65,10 @@ struct QueryRow {
 struct Aggregate {
     ndcg10: f64,
     recall20: f64,
+    file_recall20: f64,
+    ndcg10_pool: f64,
+    recall20_pool: f64,
+    file_recall20_pool: f64,
     mrr: f64,
     packed_precision: f64,
     packed_recall: f64,
@@ -218,7 +231,7 @@ fn miss_rank_histogram(corpus: &Corpus, runs: &[QueryRun]) {
     }
 }
 
-fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider, fuse_mode: &str, fixtures: &std::path::Path) -> Vec<QueryRun> {
+fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider, fuse_mode: &str, pool_top: usize, fixtures: &std::path::Path) -> Vec<QueryRun> {
     let texts: Vec<String> = corpus.docs.iter().map(|d| d.text.clone()).collect();
     let costs: Vec<i64> = corpus.docs.iter().map(|d| bench::count_tokens(&d.text)).collect();
     let bm25 = Bm25Index::build(&texts);
@@ -254,6 +267,14 @@ fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider
     } else { None };
 
     let mut runs = Vec::new();
+    let id_to_path: std::collections::HashMap<String, String> = corpus
+        .docs
+        .iter()
+        .map(|d| (d.id.clone(), d.path.clone()))
+        .collect();
+    // Within-file stage primitive: path -> member doc indices, built once.
+    let paths: Vec<String> = corpus.docs.iter().map(|d| d.path.clone()).collect();
+    let members = file_members(&paths);
     for q in &corpus.queries {
         let r_bm25 = bm25.ranking(&q.text);
         let qvec = prov.embed_one(&q.text).unwrap_or_else(|_| bench::embed::embed(&q.text));
@@ -303,6 +324,46 @@ fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider
             curve[knee] > 0.99 && curve[curve.len() - 1] - curve[knee] < 0.01;
         let ndcg10 = ndcg_at_k(&ranked_ids, &q.gold, 10);
         let recall20 = recall_at_k(&ranked_ids, &q.gold, 20);
+        let gold_files: std::collections::HashSet<String> = q
+            .gold
+            .iter()
+            .filter_map(|gid| id_to_path.get(gid).cloned())
+            .collect();
+        let file_recall20 = file_recall_at_k(&ranked_ids, &id_to_path, &gold_files, 20);
+        // File-prioritized pooling: rank files by their best fused rank,
+        // emit all symbols of the top-`pool_top` files first (fused order
+        // within file), then the rest. Pure reorder — no new signal.
+        // pool_top = 0 reproduces the raw order exactly (ablation).
+        let mut pos = vec![usize::MAX; texts.len()];
+        for (rank, &i) in order.iter().enumerate() {
+            pos[i] = rank;
+        }
+        let mut files: Vec<(&String, usize)> = members
+            .iter()
+            .map(|(p, idxs)| {
+                (
+                    p,
+                    idxs.iter().map(|&i| pos[i]).min().unwrap_or(usize::MAX),
+                )
+            })
+            .collect();
+        files.sort_by_key(|a| a.1);
+        let top: std::collections::HashSet<&String> =
+            files.into_iter().take(pool_top).map(|(p, _)| p).collect();
+        let pooled_order: Vec<usize> = order
+            .iter()
+            .filter(|&&i| top.contains(&paths[i]))
+            .chain(order.iter().filter(|&&i| !top.contains(&paths[i])))
+            .copied()
+            .collect();
+        let pooled_ids: Vec<String> = pooled_order
+            .iter()
+            .map(|&i| corpus.docs[i].id.clone())
+            .collect();
+        let ndcg10_pool = ndcg_at_k(&pooled_ids, &q.gold, 10);
+        let recall20_pool = recall_at_k(&pooled_ids, &q.gold, 20);
+        let file_recall20_pool =
+            file_recall_at_k(&pooled_ids, &id_to_path, &gold_files, 20);
         let mrr_val = mrr(&ranked_ids, &q.gold);
         let pack_p = set_precision(&sel_ids, &q.gold);
         let pack_r = set_recall(&sel_ids, &q.gold);
@@ -311,6 +372,10 @@ fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider
             bcy: bcy_at_budget(&ranked_ids, &costs, &gold, budget),
             ndcg10,
             recall20,
+            file_recall20,
+            ndcg10_pool,
+            recall20_pool,
+            file_recall20_pool,
             mrr: mrr_val,
             packed_precision: pack_p,
             packed_recall: pack_r,            rho_naive,
@@ -405,6 +470,7 @@ fn main() {
     let mut json_out = false;
     let mut embed_flag = "auto".to_string();
     let mut fuse_flag = "rrf".to_string();
+    let mut pool_top = 5usize;
     let mut tau_low = 0.35f64;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -424,12 +490,32 @@ fn main() {
             }
             "--embed" => embed_flag = args.next().unwrap_or_else(|| "auto".into()),
             "--fuse" => fuse_flag = args.next().unwrap_or_else(|| "rrf".into()),
+            "--pool" => pool_top = args.next().and_then(|s| s.parse().ok()).unwrap_or(pool_top),
             "--tau" => tau_low = args.next().and_then(|s| s.parse().ok()).unwrap_or(tau_low),
             "--json" => json_out = true,
             _ => {}
         }
     }
     let provider = pick_provider(&embed_flag);
+    // Explicit --embed ollama with a dead server used to degrade SILENTLY:
+    // cached 768d doc vecs + hash-64 query fallback = corrupt mixed run
+    // (astropy 0.2435 -> 0.1336, 2026-09-24) with a log line still claiming
+    // ollama/768d. Fail fast instead. Auto mode keeps its loud fallback.
+    if embed_flag == "ollama" {
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(3))
+            .build();
+        if agent
+            .get("http://localhost:11434/api/tags")
+            .call()
+            .is_err()
+        {
+            eprintln!(
+                "error: --embed ollama requested but localhost:11434 is unreachable (run `ollama serve`); refusing a corrupt mixed-embedding run"
+            );
+            std::process::exit(2);
+        }
+    }
     eprintln!("[bench] embed provider: {} dim={} | fuse: {}", provider.name(), provider.dim(), fuse_flag);
 
     let corpus = if fixtures.join("tasks.jsonl").exists() {
@@ -441,7 +527,7 @@ fn main() {
     let mut outs = Vec::new();
 
     for budget in budgets {
-        let mut runs = build_runs(&corpus, budget, provider.as_ref(), &fuse_flag, &fixtures);
+        let mut runs = build_runs(&corpus, budget, provider.as_ref(), &fuse_flag, pool_top, &fixtures);
         miss_rank_histogram(&corpus, &runs);
         let (rho_pt, rho_lo, rho_hi, ece_u, ece_c, br_u, br_c) =
             finalize(&mut runs, tau_low);
@@ -453,6 +539,10 @@ fn main() {
                 id: q.id.clone(),
                 ndcg10: r.ndcg10,
                 recall20: r.recall20,
+                file_recall20: r.file_recall20,
+                ndcg10_pool: r.ndcg10_pool,
+                recall20_pool: r.recall20_pool,
+                file_recall20_pool: r.file_recall20_pool,
                 mrr: r.mrr,
                 packed_precision: r.packed_precision,
                 packed_recall: r.packed_recall,
@@ -469,6 +559,11 @@ fn main() {
 
         let ndcg_vals: Vec<f64> = runs.iter().map(|r| r.ndcg10).collect();
         let recall_vals: Vec<f64> = runs.iter().map(|r| r.recall20).collect();
+        let file_recall_vals: Vec<f64> = runs.iter().map(|r| r.file_recall20).collect();
+        let ndcg_pool_vals: Vec<f64> = runs.iter().map(|r| r.ndcg10_pool).collect();
+        let recall_pool_vals: Vec<f64> = runs.iter().map(|r| r.recall20_pool).collect();
+        let file_recall_pool_vals: Vec<f64> =
+            runs.iter().map(|r| r.file_recall20_pool).collect();
         let mrr_vals: Vec<f64> = runs.iter().map(|r| r.mrr).collect();
         let pack_p_vals: Vec<f64> = runs.iter().map(|r| r.packed_precision).collect();
         let pack_r_vals: Vec<f64> = runs.iter().map(|r| r.packed_recall).collect();
@@ -478,6 +573,10 @@ fn main() {
         let agg = Aggregate {
             ndcg10: mean(&ndcg_vals),
             recall20: mean(&recall_vals),
+            file_recall20: mean(&file_recall_vals),
+            ndcg10_pool: mean(&ndcg_pool_vals),
+            recall20_pool: mean(&recall_pool_vals),
+            file_recall20_pool: mean(&file_recall_pool_vals),
             mrr: mean(&mrr_vals),
             packed_precision: mean(&pack_p_vals),
             packed_recall: mean(&pack_r_vals),
@@ -511,6 +610,22 @@ fn main() {
         println!("Ranking quality (BM25 + cosine -> RRF):");
         report("nDCG@10", &ndcg_vals, "");
         report("Recall@20", &recall_vals, "");
+        report("FileRecall@20", &file_recall_vals, "<- file-first");
+        report(
+            &format!("Pool@{pool_top} nDCG@10"),
+            &ndcg_pool_vals,
+            "<- pooled",
+        );
+        report(
+            &format!("Pool@{pool_top} Recall@20"),
+            &recall_pool_vals,
+            "<- pooled",
+        );
+        report(
+            &format!("Pool@{pool_top} FileRec@20"),
+            &file_recall_pool_vals,
+            "<- pooled",
+        );
         report("MRR", &mrr_vals, "");
         println!("Packed-context quality (knapsack DP):");
         report("Precision", &pack_p_vals, "");
