@@ -22,3 +22,6 @@
 - Real-LLM A/B (12 tasks, seed 42): bunny 68.8% [63.9–73.6], nemotron-free
   78.2%, both arms 100% success, turns ~2.2 → 1.0. (qwen3.8 run byte-identical
   to bunny — stealth-model alias suspected, counted once.)
+- Fix-location eval (15 real astropy issues, paired WITH/WITHOUT cortex):
+  mean file-F1 0.233 → **0.380** (+0.147), WITH never loses an issue;
+  span hits on 5/15 vs 3/15. N=15 — direction, not a gate.
