@@ -971,6 +971,58 @@ const SKIP_DIRS: &[&str] = &["test", "tests", "docs", "examples", "node_modules"
     "vendor", "dist", "build", ".venv", "__pycache__", "Pods", ".next", ".nuxt", "coverage", ".tox"];
 const EXTS: &[&str] = &[".py", ".rs", ".go", ".java", ".js", ".ts", ".tsx"];
 const EMBED_BATCH: usize = 100;
+/// Max chars per text sent to an embedding provider. Poison-batch guard:
+/// one giant symbol text used to 500 the whole request and (via `?`)
+/// void all 8.6k vectors. Mirrors the bench provider truncation.
+const EMBED_MAX_CHARS: usize = 1800;
+
+/// Best-effort batch embed. Truncates inputs, embeds per chunk; a failed
+/// chunk retries text-by-text so one poison text costs one vector, not the
+/// index. Returns per-input `Some(vec)`/`None` aligned with `texts` plus
+/// the failure count. Callers leave NULL blobs (cosine arm skips them,
+/// FTS still works) and report the count.
+fn embed_best_effort(
+    provider: &dyn EmbeddingProvider,
+    texts: Vec<String>,
+) -> (Vec<Option<Vec<f32>>>, usize) {
+    let texts: Vec<String> = texts
+        .into_iter()
+        .map(|t| {
+            if t.len() <= EMBED_MAX_CHARS {
+                t
+            } else {
+                t.chars().take(EMBED_MAX_CHARS).collect()
+            }
+        })
+        .collect();
+    let mut out: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+    let mut failed = 0usize;
+    for (base, chunk) in texts.chunks(EMBED_BATCH).enumerate() {
+        match provider.embed(chunk.to_vec()) {
+            Ok(vecs) if vecs.len() == chunk.len() => {
+                for (i, v) in vecs.into_iter().enumerate() {
+                    out[base * EMBED_BATCH + i] = Some(v);
+                }
+            }
+            _ => {
+                for (i, t) in chunk.iter().enumerate() {
+                    match provider.embed(vec![t.clone()]) {
+                        Ok(mut v) if v.len() == 1 => {
+                            out[base * EMBED_BATCH + i] = Some(v.remove(0));
+                        }
+                        _ => {
+                            failed += 1;
+                        }
+                    }
+                }
+                eprintln!(
+                    "warning: embedding chunk failed, recovered per-text ({failed} total failures so far)"
+                );
+            }
+        }
+    }
+    (out, failed)
+}
 /// Files larger than this are skipped (generated bundles, minified JS,
 /// vendored blobs) — same policy as CodeGraph.
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
@@ -1371,17 +1423,23 @@ fn do_index(path: String, embed: String, excludes: Vec<String>) -> Result<()> {
         eprintln!("[index] code refs: {ref_files} files, {ref_uses_total} use rows");
     }
     if !symbols.is_empty() {
-        for chunk in symbols.chunks(EMBED_BATCH) {
-            let sigs: Vec<String> = chunk.iter().map(|(_, _, _, _, _, _, embed_text)| embed_text.clone()).collect();
-            let vecs = provider.embed(sigs)?;
-            for ((rel, name, _, ls, _, _, _), vec) in chunk.iter().zip(vecs.iter()) {
-                let blob = crate::store::serialize_f32s(vec);
+        let sigs: Vec<String> = symbols.iter().map(|(_, _, _, _, _, _, embed_text)| embed_text.clone()).collect();
+        let (vecs, failed) = embed_best_effort(provider.as_ref(), sigs);
+        let mut n_embedded = 0usize;
+        for ((rel, name, _, ls, _, _, _), vec) in symbols.iter().zip(vecs.iter()) {
+            if let Some(v) = vec {
+                let blob = crate::store::serialize_f32s(v);
                 store.conn.execute(
                     "UPDATE symbols SET embedding=?1 WHERE path=?2 AND name=?3 AND line_start=?4",
                     rusqlite::params![blob, rel, name, ls],
                 )?;
+                n_embedded += 1;
             }
         }
+        if failed > 0 {
+            eprintln!("warning: {failed} symbol embeddings failed (NULL blob, FTS-only for those)");
+        }
+        eprintln!("[index] embedded {n_embedded}/{} symbols", symbols.len());
         store.set_meta("embedding_dim", &provider.dim().to_string())?;
         store.set_meta("embedding_provider", provider.name())?;
     }
@@ -1427,26 +1485,32 @@ fn do_reindex(embed: Option<String>) -> Result<()> {
     }
     let mut n_notes = 0usize;
     if !note_rows.is_empty() {
-        for chunk in note_rows.chunks(EMBED_BATCH) {
-            let texts: Vec<String> = chunk.iter().map(|(_, c)| c.clone()).collect();
-            let vecs = provider.embed(texts)?;
-            for ((id, _), vec) in chunk.iter().zip(vecs.iter()) {
-                let blob = crate::store::serialize_f32s(vec);
+        let texts: Vec<String> = note_rows.iter().map(|(_, c)| c.clone()).collect();
+        let (vecs, failed) = embed_best_effort(provider.as_ref(), texts);
+        for ((id, _), vec) in note_rows.iter().zip(vecs.iter()) {
+            if let Some(v) = vec {
+                let blob = crate::store::serialize_f32s(v);
                 store.conn.execute("UPDATE notes SET embedding=?1 WHERE id=?2", rusqlite::params![blob, id])?;
                 n_notes += 1;
             }
         }
+        if failed > 0 {
+            eprintln!("warning: {failed} note embeddings failed (NULL blob, FTS-only for those)");
+        }
     }
     let mut n_syms = 0usize;
     if !sym_rows.is_empty() {
-        for chunk in sym_rows.chunks(EMBED_BATCH) {
-            let texts: Vec<String> = chunk.iter().map(|(_, s)| s.clone()).collect();
-            let vecs = provider.embed(texts)?;
-            for ((id, _), vec) in chunk.iter().zip(vecs.iter()) {
-                let blob = crate::store::serialize_f32s(vec);
+        let texts: Vec<String> = sym_rows.iter().map(|(_, s)| s.clone()).collect();
+        let (vecs, failed) = embed_best_effort(provider.as_ref(), texts);
+        for ((id, _), vec) in sym_rows.iter().zip(vecs.iter()) {
+            if let Some(v) = vec {
+                let blob = crate::store::serialize_f32s(v);
                 store.conn.execute("UPDATE symbols SET embedding=?1 WHERE id=?2", rusqlite::params![blob, id])?;
                 n_syms += 1;
             }
+        }
+        if failed > 0 {
+            eprintln!("warning: {failed} symbol embeddings failed (NULL blob, FTS-only for those)");
         }
     }
     store.set_meta("embedding_dim", &provider.dim().to_string())?;
@@ -1678,6 +1742,35 @@ mod tests {
         assert!(filtered.iter().all(|(_, n, ..)| n != "dropme" && n != "alsodrop"),
             "excluded paths leaked: {:?}", filtered.iter().map(|(_, n, ..)| n).collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn embed_best_effort_isolates_poison_text() {
+        struct Flaky;
+        impl crate::embed::EmbeddingProvider for Flaky {
+            fn name(&self) -> &str { "flaky" }
+            fn dim(&self) -> usize { 2 }
+            fn is_local(&self) -> bool { true }
+            fn health_check(&self) -> crate::Result<()> { Ok(()) }
+            fn embed(&self, texts: Vec<String>) -> crate::Result<Vec<Vec<f32>>> {
+                if texts.iter().any(|t| t.contains("POISON")) {
+                    return Err(crate::Error::Cli("boom".into()));
+                }
+                Ok(texts.iter().map(|t| vec![t.len() as f32, 0.0]).collect())
+            }
+        }
+        let texts = vec!["aa".to_string(), "POISON".to_string(), "bbbb".to_string()];
+        let (out, failed) = embed_best_effort(&Flaky, texts);
+        assert_eq!(failed, 1);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[0], Some(vec![2.0, 0.0]));
+        assert_eq!(out[1], None);
+        assert_eq!(out[2], Some(vec![4.0, 0.0]));
+        // Truncation guard: over-long input never reaches the provider whole.
+        let long = "x".repeat(EMBED_MAX_CHARS + 100);
+        let (out2, f2) = embed_best_effort(&Flaky, vec![long]);
+        assert_eq!(f2, 0);
+        assert_eq!(out2[0], Some(vec![EMBED_MAX_CHARS as f32, 0.0]));
     }
 
     #[test]
