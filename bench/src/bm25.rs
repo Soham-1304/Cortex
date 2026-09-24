@@ -69,6 +69,16 @@ impl Bm25Index {
         });
         idx
     }
+
+    /// Document frequency of a term over the indexed corpus (for the
+    /// exact-identifier refs leg in `fuse`). Same df universe as scoring.
+    pub fn doc_freq(&self, term: &str) -> usize {
+        self.df.get(term).copied().unwrap_or(0)
+    }
+
+    pub fn doc_count(&self) -> usize {
+        self.n
+    }
 }
 
 #[cfg(test)]

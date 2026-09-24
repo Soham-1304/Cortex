@@ -272,6 +272,19 @@ fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider
         .iter()
         .map(|d| (d.id.clone(), d.path.clone()))
         .collect();
+    // Refs-leg signature tokens: path terms + first-line (signature) terms.
+    // Exact-match universe only — prose bodies are BM25's job.
+    let sig_toks: Vec<std::collections::HashSet<String>> = corpus
+        .docs
+        .iter()
+        .map(|d| {
+            let first = d.text.lines().next().unwrap_or("");
+            bench::tokenize(&d.path.replace('/', " "))
+                .into_iter()
+                .chain(bench::tokenize(first))
+                .collect()
+        })
+        .collect();
     // Within-file stage primitive: path -> member doc indices, built once.
     let paths: Vec<String> = corpus.docs.iter().map(|d| d.path.clone()).collect();
     let members = file_members(&paths);
@@ -285,6 +298,22 @@ fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider
         };
         let fused = if let Some((w_bm25, w_cos)) = crrf_weights {
             fuse::rrf_weighted(&[r_bm25, r_cos], &[w_bm25, w_cos], texts.len())
+        } else if fuse_mode == "rrf3" {
+            // Third RRF leg: exact identifier hits (IDF-weighted, generic-gated).
+            // Absent leg (no exact hits) contributes nothing — today's behavior.
+            let q_toks = bench::tokenize(&q.text);
+            let refs_s = fuse::exact_idf_scores(
+                &q_toks,
+                &sig_toks,
+                &|t| bm25.doc_freq(t),
+                bm25.doc_count(),
+            );
+            let r_refs = fuse::positive_rank_order(&refs_s);
+            if r_refs.is_empty() {
+                fuse::rrf(&[r_bm25, r_cos], texts.len())
+            } else {
+                fuse::rrf(&[r_bm25, r_cos, r_refs], texts.len())
+            }
         } else {
             fuse::rrf(&[r_bm25, r_cos], texts.len())
         };
