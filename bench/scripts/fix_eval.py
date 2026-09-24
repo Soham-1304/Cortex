@@ -33,20 +33,34 @@ API_URL = "https://openrouter.ai/api/v1/chat/completions"
 SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules", "dist", "build"}
 
 
-def call_llm(model, messages):
+def call_llm(model, messages, retries=4):
     req = {"model": model, "messages": messages, "temperature": 0,
            "max_tokens": 1200}
-    r = urllib.request.Request(
-        API_URL, data=json.dumps(req).encode(),
-        headers={"Authorization": f"Bearer {API_KEY}",
-                 "Content-Type": "application/json",
-                 "HTTP-Referer": "https://github.com/cortex",
-                 "X-Title": "cortex-fix-eval"})
-    with urllib.request.urlopen(r, timeout=120) as resp:
-        body = json.load(resp)
-    msg = body["choices"][0]["message"].get("content") or ""
-    use = body.get("usage", {}) or {}
-    return msg, use.get("prompt_tokens", 0) + use.get("completion_tokens", 0)
+    backoff = [15, 45, 120, 300]
+    last = None
+    for attempt in range(retries):
+        try:
+            r = urllib.request.Request(
+                API_URL, data=json.dumps(req).encode(),
+                headers={"Authorization": f"Bearer {API_KEY}",
+                         "Content-Type": "application/json",
+                         "HTTP-Referer": "https://github.com/cortex",
+                         "X-Title": "cortex-fix-eval"})
+            with urllib.request.urlopen(r, timeout=120) as resp:
+                body = json.load(resp)
+            msg = body["choices"][0]["message"].get("content") or ""
+            use = body.get("usage", {}) or {}
+            return msg, use.get("prompt_tokens", 0) + use.get("completion_tokens", 0)
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code}"
+            if e.code == 429 and attempt + 1 < retries:
+                time.sleep(backoff[attempt] if attempt < len(backoff) else 300)
+                continue
+            raise RuntimeError(last)
+        except Exception as e:
+            last = str(e)[:200]
+            raise RuntimeError(last)
+    raise RuntimeError(last or "llm failed")
 
 
 def tool_list_files(repo, arg):
