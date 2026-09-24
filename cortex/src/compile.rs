@@ -96,6 +96,39 @@ const GRAPH_BOOST: f64 = 0.2;
 // file-level nav −0.048/task on N=125. Helpers deleted with it;
 // file_connections() in store.rs stays for find/map.)
 
+/// File-pooled serving order (bench `--pool 10`: +0.063 span R@20 on
+/// astropy, file recall intact). Rank files by their best candidate
+/// score, emit the top-`top_n` files' candidates first (relative order
+/// preserved), then the rest. Pure reorder — scores untouched, so
+/// knapsack values, rho, and calibration are unaffected; only WHICH
+/// symbols reach the top-12 truncation changes.
+const POOL_TOP_FILES: usize = 10;
+
+fn pool_by_file(
+    cands: Vec<(SymbolHit, f64)>,
+    top_n: usize,
+) -> Vec<(SymbolHit, f64)> {
+    use std::collections::{HashMap, HashSet};
+    let top: HashSet<String> = {
+        let mut best_rank: HashMap<&str, usize> = HashMap::new();
+        for (rank, (sym, _)) in cands.iter().enumerate() {
+            best_rank.entry(sym.path.as_str()).or_insert(rank);
+        }
+        let mut files: Vec<(&str, usize)> = best_rank.into_iter().collect();
+        files.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
+        files
+            .into_iter()
+            .take(top_n)
+            .map(|(p, _)| p.to_string())
+            .collect()
+    };
+    let (mut head, mut tail): (Vec<_>, Vec<_>) = cands
+        .into_iter()
+        .partition(|(sym, _)| top.contains(&sym.path));
+    head.append(&mut tail);
+    head
+}
+
 fn rrf(rank: usize) -> f64 {
     1.0 / (RRF_K + rank as f64 + 1.0)
 }
@@ -858,6 +891,7 @@ pub fn compile(
             }
         }
         sym_cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        sym_cands = pool_by_file(sym_cands, POOL_TOP_FILES);
         sym_cands.truncate(12);
     }
     let mut items: Vec<Item> = Vec::new();
@@ -1237,6 +1271,37 @@ mod tests {
             pay.rho_naive
         );
         assert!(pay.tokens_used >= 0);
+    }
+
+    #[test]
+    fn pool_by_file_groups_top_files_first() {
+        let sym = |path: &str, name: &str| SymbolHit {
+            name: name.to_string(),
+            path: path.to_string(),
+            line_start: 1,
+            line_end: 10,
+            signature: None,
+        };
+        // Score-desc input: b0(0.9), a0(0.8), b1(0.7), a1(0.2), c0(0.1).
+        let cands = vec![
+            (sym("b.py", "b0"), 0.9),
+            (sym("a.py", "a0"), 0.8),
+            (sym("b.py", "b1"), 0.7),
+            (sym("a.py", "a1"), 0.2),
+            (sym("c.py", "c0"), 0.1),
+        ];
+        // top-1: b.py's symbols first (stable), then rest in order.
+        let out = pool_by_file(cands.clone(), 1);
+        let names: Vec<&str> = out.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert_eq!(names, vec!["b0", "b1", "a0", "a1", "c0"]);
+        // top-0: ablation, order untouched.
+        let out0 = pool_by_file(cands.clone(), 0);
+        let names0: Vec<&str> = out0.iter().map(|(s, _)| s.name.as_str()).collect();
+        assert_eq!(names0, vec!["b0", "a0", "b1", "a1", "c0"]);
+        // Scores untouched by the reorder.
+        assert!(out.iter().all(|(_, s)| *s > 0.0));
+        let scores: Vec<f64> = out.iter().map(|(_, s)| *s).collect();
+        assert_eq!(scores, vec![0.9, 0.7, 0.8, 0.2, 0.1]);
     }
 
     #[test]
