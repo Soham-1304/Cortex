@@ -19,3 +19,6 @@
   RRF + knapsack context compiler, MCP stdio server, CLI.
 - ρ-context estimator with LOQO holdout + bootstrap CI (|Δ| ≤ 0.02).
 - Sim A/B: 70.5% default / 75–80% heavy token reduction at parity-or-better success.
+- Real-LLM A/B (12 tasks, seed 42): bunny 68.8% [63.9–73.6], nemotron-free
+  78.2%, both arms 100% success, turns ~2.2 → 1.0. (qwen3.8 run byte-identical
+  to bunny — stealth-model alias suspected, counted once.)
