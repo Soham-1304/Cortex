@@ -1305,6 +1305,29 @@ mod tests {
     }
 
     #[test]
+    fn compile_redacts_aws_keys_in_memories() {
+        let s = Store::open_in_memory().unwrap();
+        s.add_note(
+            "sess",
+            "deploy uses AKIAIOSFODNN7EXAMPLE for the staging bucket",
+            "decision",
+            &["deploy"],
+        )
+        .unwrap();
+        let cf = CoreFile { path: "x".into(), preamble: None, sections: Default::default() };
+        let emb = HashEmbedder::new(64);
+        let pay = compile(&s, &cf, &emb, "deploy staging bucket", 5000).unwrap();
+        assert!(!pay.memories.is_empty(), "note must be recalled: {:?}", pay.memories);
+        for m in &pay.memories {
+            assert!(
+                !m.content.contains("AKIAIOSFODNN7EXAMPLE"),
+                "raw key leaked into payload: {}",
+                m.content
+            );
+        }
+    }
+
+    #[test]
     fn budget_tight_core_wins() {
         let (s, mut cf) = seeded();
         cf.set_section("Profile", &"word ".repeat(200));

@@ -434,6 +434,27 @@ mod tests {
         assert_eq!(v.len(), 64);
     }
     #[test]
+    fn ollama_health_fails_on_unreachable_server() {
+        // Port 9 (discard) is virtually always closed: health must actually
+        // probe instead of passing on a non-empty URL. Must return fast
+        // (no multi-second hangs in tests/CI).
+        let p = OllamaProvider {
+            url: "http://127.0.0.1:9".to_string(),
+            model: "nomic-embed-text".to_string(),
+            timeout_ms: 5000,
+        };
+        let t0 = std::time::Instant::now();
+        assert!(p.health_check().is_err(), "unreachable server must fail health");
+        assert!(t0.elapsed().as_secs() < 10, "health check must not hang");
+        let empty = OllamaProvider {
+            url: "".to_string(),
+            model: "x".to_string(),
+            timeout_ms: 5000,
+        };
+        assert!(empty.health_check().is_err());
+    }
+
+    #[test]
     fn hash_empty_text_is_zero_vector() {
         let h = HashEmbedder::new(8);
         let v = h.embed(vec!["".to_string()]).unwrap().remove(0);
