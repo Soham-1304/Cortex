@@ -52,6 +52,30 @@ TASKS = {
 ALLOW_SUFFIX = (".rs", ".toml", ".md", ".py")
 
 
+def extract_json(text):
+    """First balanced {...} block (handles nested edit payloads and
+    prose-wrapped answers)."""
+    start = text.find("{")
+    if start < 0:
+        raise ValueError("no JSON object")
+    depth, instr, esc = 0, False, False
+    for i in range(start, len(text)):
+        c = text[i]
+        if esc:
+            esc = False
+        elif c == "\\" and instr:
+            esc = True
+        elif c == '"' :
+            instr = not instr
+        elif not instr and c == "{":
+            depth += 1
+        elif not instr and c == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:i + 1])
+    raise ValueError("unbalanced JSON")
+
+
 def call_llm(model, messages, retries=4):
     req = {"model": model, "messages": messages, "temperature": 0,
            "max_tokens": 2000}
@@ -122,7 +146,9 @@ def tool_read_file(repo, arg):
 
 def tool_edit_file(repo, arg):
     try:
-        obj = json.loads(arg)
+        obj = json.loads(arg) if isinstance(arg, str) else arg
+        if isinstance(obj, str):
+            obj = json.loads(obj)
         path, old, new = obj["path"], obj["old"], obj["new"]
     except Exception:
         return "error: arg must be JSON {path, old, new}"
@@ -171,8 +197,11 @@ SYS = ("You fix a bug in the Cortex repo with tools; call exactly one per turn "
        "as JSON {{\"tool\": name, \"arg\": string}} or finish with JSON "
        "{{\"done\": true, \"summary\": string}} when the hidden tests should pass "
        "and the full suite stays green. Tools: list_files [subdir], read_file "
-       "<path[:lo-hi]>, edit_file <{{\"path, old, new}} JSON>, run_tests "
-       "<test-filter|FULL>{recall}. Verify with run_tests before finishing.")
+       "<path[:lo-hi]>, edit_file <JSON string {{\"path\": \"cortex/src/x.rs\", "
+       "\"old\": \"exact lines to replace\", \"new\": \"replacement lines\"}}>, "
+       "run_tests <test-filter|FULL>{recall}. "
+       "For edit_file, old must match the file EXACTLY once (copy it from a "
+       "read_file result). Verify with run_tests before finishing.")
 
 
 def run_arm(model, task, repo, workdir, with_recall, max_steps=14):
@@ -194,7 +223,7 @@ def run_arm(model, task, repo, workdir, with_recall, max_steps=14):
             break
         messages.append({"role": "assistant", "content": text})
         try:
-            obj = json.loads(text[text.find("{"):text.rfind("}") + 1])
+            obj = extract_json(text)
         except Exception:
             steps.append({"raw": text[:300]})
             messages.append({"role": "user", "content": "Reply with one JSON tool call or done."})
