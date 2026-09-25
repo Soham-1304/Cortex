@@ -56,6 +56,9 @@ def call_llm(model, messages, retries=4):
             with urllib.request.urlopen(r, timeout=120) as resp:
                 body = json.load(resp)
             msg = body["choices"][0]["message"].get("content") or ""
+            if not msg.strip():
+                # Reasoning models (e.g. GLM on NIM) put output here.
+                msg = body["choices"][0]["message"].get("reasoning_content") or ""
             use = body.get("usage", {}) or {}
             return msg, use.get("prompt_tokens", 0) + use.get("completion_tokens", 0)
         except urllib.error.HTTPError as e:
@@ -68,6 +71,44 @@ def call_llm(model, messages, retries=4):
             last = str(e)[:200]
             raise RuntimeError(last)
     raise RuntimeError(last or "llm failed")
+
+
+def extract_response_json(text):
+    """Best JSON block: last balanced {...} containing a tool/files/done key
+    (reasoning traces carry decoy blocks; the decision comes last). Falls
+    back to the greedy first-to-last span for single-block answers."""
+    cands = []
+    i = 0
+    while True:
+        s = text.find("{", i)
+        if s < 0:
+            break
+        depth, instr, esc = 0, False, False
+        for j in range(s, len(text)):
+            c = text[j]
+            if esc:
+                esc = False
+            elif c == "\\" and instr:
+                esc = True
+            elif c == '"':
+                instr = not instr
+            elif not instr and c == "{":
+                depth += 1
+            elif not instr and c == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        o = json.loads(text[s:j + 1])
+                        if isinstance(o, dict) and any(
+                                k in o for k in ("tool", "files", "done")):
+                            cands.append(o)
+                    except Exception:
+                        pass
+                    break
+        i = s + 1
+    if cands:
+        return cands[-1]
+    return json.loads(text[text.find("{"):text.rfind("}") + 1])
 
 
 def tool_list_files(repo, arg):
@@ -194,7 +235,7 @@ def run_arm(model, issue, repo, workdir, with_recall, max_steps):
         tokens += tk
         messages.append({"role": "assistant", "content": text})
         try:
-            obj = json.loads(text[text.find("{"):text.rfind("}") + 1])
+            obj = extract_response_json(text)
         except Exception:
             steps.append({"raw": text[:500]})
             messages.append({"role": "user", "content": "Reply with one JSON tool call or the final answer."})
@@ -220,7 +261,7 @@ def run_arm(model, issue, repo, workdir, with_recall, max_steps):
         try:
             text, tk = call_llm(model, messages)
             tokens += tk
-            final = json.loads(text[text.find("{"):text.rfind("}") + 1])
+            final = extract_response_json(text)
             steps.append({"final": "forced"})
         except Exception as e:
             steps.append({"final_failed": str(e)[:200]})
