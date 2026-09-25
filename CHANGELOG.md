@@ -28,6 +28,9 @@
   agent. WITH-arm range 0.035 vs WITHOUT 0.258 across all four: stability
   finding holds. Blocker is agent strength (8 steps, truncated reads),
   not retrieval — bench R@20 0.500 on the same index.
+- Direct single-shot eval (no tool loop, bunny, 15 real issues): WITHOUT
+  file-F1 0.000 (0/74 spans) vs WITH 0.133 (2 files, 2 spans). Bare model
+  gets nothing; cortex context is the only signal. Small N, clean split.
 - Dogfood agent loop (edit+test tools, red→green hidden tests, this repo):
   health-ping solved 1-1 (both arms, one edit each); secret redaction 0-0
   (neither arm attempted an edit in 14 reads). Instrument valid (tree
