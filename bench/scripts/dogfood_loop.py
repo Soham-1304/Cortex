@@ -236,7 +236,8 @@ def run_arm(model, task, repo, workdir, with_recall, max_steps=14):
             steps.append({"bad_tool": name})
             messages.append({"role": "user", "content": "unknown tool. Use list_files, read_file, edit_file, run_tests" + recall_doc + "."})
             continue
-        steps.append({"tool": name, "arg": arg[:150]})
+        log_arg = arg if name != "edit_file" else arg[:2000]
+        steps.append({"tool": name, "arg": log_arg})
         try:
             result = tools[name](arg)
         except Exception as e:
@@ -246,7 +247,9 @@ def run_arm(model, task, repo, workdir, with_recall, max_steps=14):
 
 
 def score_task(repo, task):
-    """Hidden tests pass AND full lib suite green. Runs tests directly."""
+    """Hidden tests pass AND full lib suite green apart from the OTHER
+    tasks' known-red hidden tests (each arm fixes one task; the other
+    task's tests are red by design until fixed)."""
     hidden = TASKS[task]["hidden"]
     hidden_ok = True
     for h in hidden:
@@ -254,12 +257,22 @@ def score_task(repo, task):
                            capture_output=True, text=True, cwd=repo, timeout=300)
         if "test result: ok" not in (r.stdout + r.stderr):
             hidden_ok = False
+    other_hidden = {t for task2 in TASKS for t in TASKS[task2]["hidden"]} - set(hidden)
     r2 = subprocess.run(["cargo", "test", "-p", "cortex", "--lib"],
                         capture_output=True, text=True, cwd=repo, timeout=600)
-    suite_ok = "test result: ok" in (r2.stdout + r2.stderr) and "FAILED" not in (r2.stdout + r2.stderr)
-    fails = (r2.stdout + r2.stderr).count("FAILED")
-    return {"hidden_pass": hidden_ok, "suite_green": suite_ok and fails == 0,
-            "solved": hidden_ok and suite_ok and fails == 0}
+    out = r2.stdout + r2.stderr
+    failed = set()
+    if "failures:" in out:
+        tail = out.split("failures:")[-1]
+        for line in tail.splitlines():
+            tok = line.strip().split()[0].rstrip(":,") if line.strip().split() else ""
+            if "::" in tok:
+                failed.add(tok)
+    unexpected = {f for f in failed if not any(h in f for h in other_hidden)}
+    suite_ok = not unexpected
+    return {"hidden_pass": hidden_ok, "suite_green": suite_ok,
+            "failed_tests": sorted(failed),
+            "solved": hidden_ok and suite_ok}
 
 
 def main():
