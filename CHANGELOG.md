@@ -11,7 +11,8 @@
   hash-query corruption).
 - All harnesses tag output (timestamp, version, provider/config).
 - Refuted and removed: CRRF (≡RRF), GAK-pack (eff R@20 0.03), Task-4 graph
-  spread (−0.048 file-level), heuristic + Qwen rerank.
+  spread (−0.048 file-level), heuristic + Qwen rerank, raises leg (error-name
+  →raise-site votes fire but spread across dozens of sites; aggregates flat).
 
 ## v0.1.0
 
