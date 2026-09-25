@@ -31,6 +31,11 @@
 - Direct single-shot eval (no tool loop, bunny, 15 real issues): WITHOUT
   file-F1 0.000 (0/74 spans) vs WITH 0.133 (2 files, 2 spans). Bare model
   gets nothing; cortex context is the only signal. Small N, clean split.
+- Memory-strengthening run (15 issues × 4 replay rounds, same DB): nav span
+  0.667 / file 0.867 FLAT all rounds while recall_count 109→~270, entity
+  weights →551. Reinforcement rewards exposure, not usefulness — no accuracy
+  slope. Pitch unproven; loop needs a usefulness signal (agent feedback or
+  success labels), not just recall counts.
 - Dogfood agent loop (edit+test tools, red→green hidden tests, this repo):
   health-ping solved 1-1 (both arms, one edit each); secret redaction 0-0
   (neither arm attempted an edit in 14 reads). Instrument valid (tree
