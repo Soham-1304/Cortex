@@ -39,19 +39,23 @@ def call_llm(model, messages, retries=4):
     last = None
     for attempt in range(retries):
         try:
+            t0 = time.time()
             r = urllib.request.Request(
                 api_url, data=json.dumps(req).encode(),
                 headers={"Authorization": f"Bearer {api_key}",
                          "Content-Type": "application/json",
                          "HTTP-Referer": "https://github.com/cortex",
                          "X-Title": "cortex-fix-direct"})
-            with urllib.request.urlopen(r, timeout=180) as resp:
+            with urllib.request.urlopen(r, timeout=300) as resp:
                 body = json.load(resp)
+            dt = round(time.time() - t0, 1)
             msg = body["choices"][0]["message"].get("content") or ""
             if not msg.strip():
                 m = body["choices"][0]["message"]
                 msg = m.get("reasoning_content") or m.get("reasoning") or ""
-            return msg
+            use = body.get("usage", {}) or {}
+            toks = use.get("prompt_tokens", 0) + use.get("completion_tokens", 0)
+            return msg, toks, dt
         except urllib.error.HTTPError as e:
             last = f"HTTP {e.code}"
             if e.code == 429 and attempt + 1 < retries:
@@ -94,7 +98,7 @@ ASK = ("Name the files and line ranges that must change to fix this issue. "
 
 
 def ask(model, prompt):
-    text = call_llm(model, [{"role": "user", "content": prompt}])
+    text, toks, dt = call_llm(model, [{"role": "user", "content": prompt}])
     cands = []
     i = 0
     while True:
@@ -125,8 +129,8 @@ def ask(model, prompt):
                     break
         i = s + 1
     if not cands:
-        return None, text[:500]
-    return cands[-1], None
+        return None, text[:500], toks, dt
+    return cands[-1], None, toks, dt
 
 
 def score(final, gold):
@@ -171,20 +175,25 @@ def main():
         gold = json.loads(t["gold_context"])
         row = {"id": t["instance_id"]}
         try:
-            final, raw = ask(model, "ISSUE:\n" + t["problem_statement"][:3000] + "\n\n" + ASK)
-            row["without"] = {"score": score(final, gold), "raw": raw}
+            final, raw, toks, dt = ask(model, "ISSUE:\n" + t["problem_statement"][:3000] + "\n\n" + ASK)
+            row["without"] = {"score": score(final, gold), "raw": raw,
+                              "tokens": toks, "seconds": dt}
         except Exception as e:
             row["without"] = {"score": score(None, gold), "error": str(e)[:200]}
         try:
             ctx = cortex_context(workdir, t["problem_statement"])
-            final, raw = ask(model, "ISSUE:\n" + t["problem_statement"][:3000] +
+            final, raw, toks, dt = ask(model, "ISSUE:\n" + t["problem_statement"][:3000] +
                              "\n\nCORTEX CONTEXT:\n" + ctx + "\n\n" + ASK)
-            row["with"] = {"score": score(final, gold), "raw": raw}
+            row["with"] = {"score": score(final, gold), "raw": raw,
+                           "tokens": toks, "seconds": dt}
         except Exception as e:
             row["with"] = {"score": score(None, gold), "error": str(e)[:200]}
         log["issues"].append(row)
-        print(f"{t['instance_id'][-8:]} without={row['without']['score']['file_f1']} "
-              f"with={row['with']['score']['file_f1']}", flush=True)
+        wo, wi = row["without"], row["with"]
+        print(f"{t['instance_id'][-8:]} without={wo['score']['file_f1']} "
+              f"({wo.get('tokens', '?')} tok, {wo.get('seconds', '?')}s) "
+              f"with={wi['score']['file_f1']} "
+              f"({wi.get('tokens', '?')} tok, {wi.get('seconds', '?')}s)", flush=True)
         json.dump(log, open(outpath, "w"), indent=1)
     for arm in ("without", "with"):
         f1s = [i[arm]["score"]["file_f1"] for i in log["issues"]]
