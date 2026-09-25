@@ -123,6 +123,22 @@ def tool_read_file(repo, arg):
     return "\n".join(numbered)[:4000]
 
 
+def tool_find(workdir, query):
+    env = dict(os.environ)
+    r = subprocess.run(
+        [CORTEX, "find", query[:200], "-n", "10"],
+        capture_output=True, text=True, env=env, cwd=workdir, timeout=120)
+    return (r.stdout or r.stderr)[-2500:] or "(no hits)"
+
+
+def tool_map(workdir, query):
+    env = dict(os.environ)
+    r = subprocess.run(
+        [CORTEX, "map", query[:200]],
+        capture_output=True, text=True, env=env, cwd=workdir, timeout=120)
+    return (r.stdout or r.stderr)[-2500:] or "(no map)"
+
+
 def tool_recall(workdir, query):
     env = dict(os.environ)
     r = subprocess.run(
@@ -140,21 +156,32 @@ def tool_recall(workdir, query):
     return "\n".join(lines)[:4000] or "(no hits)"
 
 
-SYS = ("You are fixing a bug in a large repo. You have tools; call exactly one "
+SYS_BASE = ("You are fixing a bug in a large repo. You have tools; call exactly one "
        "per turn as JSON {{\"tool\": name, \"arg\": string}} or give the final "
        "answer as JSON {{\"files\": [paths], \"spans\": [{{\"file\": p, "
        "\"start_line\": n, \"end_line\": m}}], \"rationale\": string}}. "
-       "Tools: list_files [subdir], read_file <path[:lo-hi]>{recall}. "
+       "Tools: list_files [subdir], read_file <path[:lo-hi>]"
+       "{cortex} "
        "Be precise: name the smallest region that must change.")
+SYS_CORTEX = (" Cortex tools: recall <query> = ranked memories+symbols under "
+       "a token budget; find <identifier> = exact defs/uses with file "
+       "connections (no embeddings, use for precise names); map <query> = file "
+       "roadmap (entry points, imports, used-by, <=1k tokens, start here for "
+       "unfamiliar areas).")
 
 
 def run_arm(model, issue, repo, workdir, with_recall, max_steps):
-    recall_doc = ", recall <query>" if with_recall else ""
+    recall_doc = ""
+    sys_text = SYS_BASE.format(cortex="")
     tools = {"list_files": lambda a: tool_list_files(repo, a),
              "read_file": lambda a: tool_read_file(repo, a)}
     if with_recall:
+        recall_doc = ", recall <query>, find <identifier>, map <query>"
+        sys_text = SYS_BASE.format(cortex="." + SYS_CORTEX)
         tools["recall"] = lambda a: tool_recall(workdir, a)
-    messages = [{"role": "system", "content": SYS.format(recall=recall_doc)},
+        tools["find"] = lambda a: tool_find(workdir, a)
+        tools["map"] = lambda a: tool_map(workdir, a)
+    messages = [{"role": "system", "content": sys_text},
                 {"role": "user", "content": "ISSUE:\n" + issue[:3000]}]
     steps, tokens = [], 0
     final = None
