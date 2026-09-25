@@ -57,8 +57,10 @@ def call_llm(model, messages, retries=4):
                 body = json.load(resp)
             msg = body["choices"][0]["message"].get("content") or ""
             if not msg.strip():
-                # Reasoning models (e.g. GLM on NIM) put output here.
-                msg = body["choices"][0]["message"].get("reasoning_content") or ""
+                # Reasoning models put output here (NIM: reasoning_content,
+                # OpenRouter: reasoning).
+                m = body["choices"][0]["message"]
+                msg = m.get("reasoning_content") or m.get("reasoning") or ""
             use = body.get("usage", {}) or {}
             return msg, use.get("prompt_tokens", 0) + use.get("completion_tokens", 0)
         except urllib.error.HTTPError as e:

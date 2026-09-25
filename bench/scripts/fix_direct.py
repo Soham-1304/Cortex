@@ -34,7 +34,7 @@ URLS = {
 def call_llm(model, messages, retries=4):
     api_key, api_url = URLS[BACKEND["name"]]
     req = {"model": model, "messages": messages, "temperature": 0,
-           "max_tokens": 1500}
+           "max_tokens": 3000}
     backoff = [15, 45, 120, 300]
     last = None
     for attempt in range(retries):
@@ -49,7 +49,8 @@ def call_llm(model, messages, retries=4):
                 body = json.load(resp)
             msg = body["choices"][0]["message"].get("content") or ""
             if not msg.strip():
-                msg = body["choices"][0]["message"].get("reasoning_content") or ""
+                m = body["choices"][0]["message"]
+                msg = m.get("reasoning_content") or m.get("reasoning") or ""
             return msg
         except urllib.error.HTTPError as e:
             last = f"HTTP {e.code}"
