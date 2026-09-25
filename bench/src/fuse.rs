@@ -43,8 +43,8 @@ pub fn exact_idf_scores(
     sig_toks: &[std::collections::HashSet<String>],
     doc_freq: &dyn Fn(&str) -> usize,
     n_docs: usize,
+    generic_frac: f64,
 ) -> Vec<f64> {
-    const GENERIC_FRAC: f64 = 0.02;
     let n = n_docs as f64;
     let mut seen = std::collections::HashSet::new();
     let mut votes: Vec<(f64, Vec<usize>)> = Vec::new();
@@ -54,7 +54,7 @@ pub fn exact_idf_scores(
             continue;
         }
         let df = doc_freq(t) as f64;
-        if df / n > GENERIC_FRAC {
+        if df / n > generic_frac {
             continue;
         }
         let idf = (1.0 + (n - df + 0.5) / (df + 0.5)).ln();
@@ -146,19 +146,19 @@ mod tests {
             _ => 0,
         };
         let q = vec!["plot_wcs".to_string(), "self".to_string()];
-        let s = exact_idf_scores(&q, &sigs, &df, 100);
+        let s = exact_idf_scores(&q, &sigs, &df, 100, 0.02);
         assert_eq!(s[7], 1.0);
         assert!(s.iter().enumerate().all(|(i, &v)| i == 7 || v == 0.0));
         // Query-side dedup: repeated token votes once.
         let q2 = vec!["plot_wcs".to_string(), "plot_wcs".to_string()];
-        assert_eq!(exact_idf_scores(&q2, &sigs, &df, 100), s);
+        assert_eq!(exact_idf_scores(&q2, &sigs, &df, 100, 0.02), s);
     }
 
     #[test]
     fn exact_idf_no_hits_gives_empty_ranking() {
         use std::collections::HashSet;
         let sigs = vec![HashSet::from(["aaa".to_string()])];
-        let s = exact_idf_scores(&["zzz".to_string()], &sigs, &|_| 0, 1);
+        let s = exact_idf_scores(&["zzz".to_string()], &sigs, &|_| 0, 1, 0.02);
         assert_eq!(s, vec![0.0]);
         assert!(positive_rank_order(&s).is_empty());
     }

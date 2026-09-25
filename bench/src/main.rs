@@ -244,7 +244,7 @@ fn miss_rank_histogram(corpus: &Corpus, runs: &[QueryRun]) {
     }
 }
 
-fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider, fuse_mode: &str, pool_top: usize, fixtures: &std::path::Path) -> Vec<QueryRun> {
+fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider, fuse_mode: &str, pool_top: usize, generic_frac: f64, fixtures: &std::path::Path) -> Vec<QueryRun> {
     let texts: Vec<String> = corpus.docs.iter().map(|d| d.text.clone()).collect();
     let costs: Vec<i64> = corpus.docs.iter().map(|d| bench::count_tokens(&d.text)).collect();
     let bm25 = Bm25Index::build(&texts);
@@ -320,6 +320,7 @@ fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider
                 &sig_toks,
                 &|t| bm25.doc_freq(t),
                 bm25.doc_count(),
+                generic_frac,
             );
             let r_refs = fuse::positive_rank_order(&refs_s);
             if r_refs.is_empty() {
@@ -513,6 +514,7 @@ fn main() {
     let mut embed_flag = "auto".to_string();
     let mut fuse_flag = "rrf".to_string();
     let mut pool_top = 5usize;
+    let mut generic_frac = 0.05f64;
     let mut tau_low = 0.35f64;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -533,6 +535,7 @@ fn main() {
             "--embed" => embed_flag = args.next().unwrap_or_else(|| "auto".into()),
             "--fuse" => fuse_flag = args.next().unwrap_or_else(|| "rrf".into()),
             "--pool" => pool_top = args.next().and_then(|s| s.parse().ok()).unwrap_or(pool_top),
+            "--generic" => generic_frac = args.next().and_then(|s| s.parse().ok()).unwrap_or(generic_frac),
             "--tau" => tau_low = args.next().and_then(|s| s.parse().ok()).unwrap_or(tau_low),
             "--json" => json_out = true,
             _ => {}
@@ -570,7 +573,7 @@ fn main() {
     let mut outs = Vec::new();
 
     for budget in budgets {
-        let mut runs = build_runs(&corpus, budget, provider.as_ref(), &fuse_flag, pool_top, &fixtures);
+        let mut runs = build_runs(&corpus, budget, provider.as_ref(), &fuse_flag, pool_top, generic_frac, &fixtures);
         miss_rank_histogram(&corpus, &runs);
         let (rho_pt, rho_lo, rho_hi, ece_u, ece_c, br_u, br_c) =
             finalize(&mut runs, tau_low);
