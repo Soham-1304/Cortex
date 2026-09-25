@@ -28,3 +28,7 @@
   agent. WITH-arm range 0.035 vs WITHOUT 0.258 across all four: stability
   finding holds. Blocker is agent strength (8 steps, truncated reads),
   not retrieval — bench R@20 0.500 on the same index.
+- Dogfood agent loop (edit+test tools, red→green hidden tests, this repo):
+  health-ping solved 1-1 (both arms, one edit each); secret redaction 0-0
+  (neither arm attempted an edit in 14 reads). Instrument valid (tree
+  restores clean); task set brackets agent ability without separating arms.
