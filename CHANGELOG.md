@@ -23,7 +23,8 @@
   78.2%, both arms 100% success, turns ~2.2 → 1.0. (qwen3.8 run byte-identical
   to bunny — stealth-model alias suspected, counted once.)
 - Fix-location eval (15 real astropy issues, paired WITH/WITHOUT cortex):
-  three runs: (0.233→0.380), (0.491→0.367), (0.358→0.402). Mean effect
-  inconclusive — WITHOUT-arm self-variance (range 0.258) dominates.
-  WITH arm stable across runs (range 0.035): recall anchors the file set,
-  exploration lottery removed. Stabilized agent needed before any verdict.
+  four runs: (0.233→0.380), (0.491→0.367), (0.358→0.402), (0.244→0.258).
+  Pooled means tied (0.344 vs 0.352). No accuracy effect at N=15 with this
+  agent. WITH-arm range 0.035 vs WITHOUT 0.258 across all four: stability
+  finding holds. Blocker is agent strength (8 steps, truncated reads),
+  not retrieval — bench R@20 0.500 on the same index.
