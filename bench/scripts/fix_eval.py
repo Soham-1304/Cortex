@@ -29,11 +29,18 @@ CORTEX = os.environ.get("CORTEX_BIN",
                              / "target" / "release" / "cortex"))
 API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
+NVIDIA_KEY = os.environ.get("NVIDIA_API_KEY", "")
+NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+BACKEND = {"name": "openrouter"}
 
 SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules", "dist", "build"}
 
 
 def call_llm(model, messages, retries=4):
+    if BACKEND["name"] == "nvidia":
+        api_url, api_key = NVIDIA_URL, NVIDIA_KEY
+    else:
+        api_url, api_key = API_URL, API_KEY
     req = {"model": model, "messages": messages, "temperature": 0,
            "max_tokens": 1200}
     backoff = [15, 45, 120, 300]
@@ -41,8 +48,8 @@ def call_llm(model, messages, retries=4):
     for attempt in range(retries):
         try:
             r = urllib.request.Request(
-                API_URL, data=json.dumps(req).encode(),
-                headers={"Authorization": f"Bearer {API_KEY}",
+                api_url, data=json.dumps(req).encode(),
+                headers={"Authorization": f"Bearer {api_key}",
                          "Content-Type": "application/json",
                          "HTTP-Referer": "https://github.com/cortex",
                          "X-Title": "cortex-fix-eval"})
@@ -225,17 +232,23 @@ def main():
     for i, a in enumerate(args):
         if a == "--model":
             model = args[i + 1]
+        if a == "--backend":
+            BACKEND["name"] = args[i + 1]
         if a == "--limit":
             limit = int(args[i + 1])
         if a == "--steps":
             max_steps = int(args[i + 1])
-    if not API_KEY:
+    if BACKEND["name"] == "nvidia" and not NVIDIA_KEY:
+        print("NVIDIA_API_KEY not set", file=sys.stderr)
+        sys.exit(2)
+    if BACKEND["name"] != "nvidia" and not API_KEY:
         print("OPENROUTER_API_KEY not set", file=sys.stderr)
         sys.exit(2)
     tasks = [json.loads(l) for l in open(fix) if l.strip()]
     if limit:
         tasks = tasks[:limit]
     log = {"provenance": {"generated_at_unix": int(time.time()), "model": model,
+                          "backend": BACKEND["name"],
                           "max_steps": max_steps, "repo": repo},
            "issues": []}
     for t in tasks:
