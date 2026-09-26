@@ -41,3 +41,8 @@
   health-ping solved 1-1 (both arms, one edit each); secret redaction 0-0
   (neither arm attempted an edit in 14 reads). Instrument valid (tree
   restores clean); task set brackets agent ability without separating arms.
+- Fixed two failing tests on v2 (both specced-but-unimplemented, failing on
+  clean tree): AWS-key redaction at serve time (`AKIA`+16 scrubbed from
+  recalled memory payloads, store keeps raw for FTS) and Ollama
+  `health_check` live probe (`GET /api/tags`, 3s cap) so dead servers report
+  missing instead of silently degrading to hash vectors.
