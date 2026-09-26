@@ -46,3 +46,8 @@
   recalled memory payloads, store keeps raw for FTS) and Ollama
   `health_check` live probe (`GET /api/tags`, 3s cap) so dead servers report
   missing instead of silently degrading to hash vectors.
+- Refuted and removed: leading intent comments in indexed text (no-gap +
+  cap-10 rule, Python `full_text` + non-Python signature twin). Django gate:
+  file 0.822→0.8095, span 0.343→0.337, nDCG −0.026 — down on every metric.
+  Comments share generic vocab / inflate costs; no signal. Fixture restored,
+  code fully reverted.
