@@ -61,6 +61,32 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     crate::store::cosine(a, b)
 }
 
+/// Secret redaction at serving time: AWS access-key IDs (`AKIA` + 16
+/// `[A-Z0-9]`) are scrubbed from recalled memory text before it reaches
+/// the agent. Stored rows keep raw text (FTS still matches); only the
+/// payload is scrubbed. No regex crate — manual scan over the marker.
+fn redact_secrets(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes.len() - i >= 20
+            && &bytes[i..i + 4] == b"AKIA"
+            && bytes[i + 4..i + 20]
+                .iter()
+                .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        {
+            out.push_str("[REDACTED-AWS-KEY]");
+            i += 20;
+        } else {
+            let ch = s[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
 // Dim-mismatch warnings are process-once per table (not per compile() call)
 // so loops over compiles (e.g. recall sweeps, benches) don't spam stderr.
 // One `Once` per table rather than a single shared one: notes and symbols
@@ -932,12 +958,14 @@ pub fn compile(
     let mut weighted: f64 = 0.0;
     for (i, (id, content, score)) in mem_cands.iter().enumerate() {
         if sel_set.contains(&i) {
-            let cost = count_tokens(content).max(1);
+            // Redact after selection (ranking sees raw text), before serving.
+            let shown = redact_secrets(content);
+            let cost = count_tokens(&shown).max(1);
             packed_cost += cost;
             weighted += *score * cost as f64;
             out_mems.push(MemoryHit {
                 id: *id,
-                content: content.clone(),
+                content: shown,
                 score: *score,
             });
         }
@@ -1302,6 +1330,25 @@ mod tests {
         assert!(out.iter().all(|(_, s)| *s > 0.0));
         let scores: Vec<f64> = out.iter().map(|(_, s)| *s).collect();
         assert_eq!(scores, vec![0.9, 0.7, 0.8, 0.2, 0.1]);
+    }
+
+    #[test]
+    fn redact_secrets_shapes() {
+        assert_eq!(redact_secrets("nothing here"), "nothing here");
+        assert_eq!(redact_secrets(""), "");
+        // Exact 20-char key scrubbed mid-text.
+        assert_eq!(
+            redact_secrets("key AKIAIOSFODNN7EXAMPLE end"),
+            "key [REDACTED-AWS-KEY] end"
+        );
+        // Short / lowercase lookalikes untouched.
+        assert_eq!(redact_secrets("AKIA SHORT"), "AKIA SHORT");
+        assert_eq!(redact_secrets("akiaiosfodnn7example12"), "akiaiosfodnn7example12");
+        // Unicode around the key: byte walk stays on char boundaries.
+        assert_eq!(
+            redact_secrets("déploy AKIAIOSFODNN7EXAMPLE ☃"),
+            "déploy [REDACTED-AWS-KEY] ☃"
+        );
     }
 
     #[test]

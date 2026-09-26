@@ -102,6 +102,16 @@ impl EmbeddingProvider for OllamaProvider {
         if self.url.is_empty() {
             return Err(crate::Error::Cli("ollama url empty".into()));
         }
+        // Live probe: a configured-but-dead server must report missing, not
+        // ok — otherwise recall silently degrades to hash vectors. Capped
+        // timeout so `embeddings list` and recall fail fast, never hang.
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_millis(self.timeout_ms.min(3000)))
+            .build();
+        agent
+            .get(&format!("{}/api/tags", self.url.trim_end_matches('/')))
+            .call()
+            .map_err(|e| crate::Error::Cli(format!("ollama unreachable at {}: {e}", self.url)))?;
         Ok(())
     }
     fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
