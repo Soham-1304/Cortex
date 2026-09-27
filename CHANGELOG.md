@@ -67,3 +67,8 @@
   written at index time (+walk-root meta, dead-row sweep), `status` reports
   clean/dirty/missing/untracked. Live-verified: edit+add+re-index cycle
   reports correctly. Triggers/watcher deferred to B-2.
+- Refuted and removed: file-content leg (A-1: file BM25+cosine RRF added to
+  member symbols). Django gate: file 0.822->0.736, span 0.343->0.351 (noise),
+  nDCG -0.023. Mechanism matches the GAK-pack failure: aggregated file
+  vocabulary lifts big wrong-file neighborhoods uniformly, burying the
+  precise symbol legs. Pooling had nothing left to add (raw==pool).
