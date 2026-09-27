@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS sessions(
 CREATE TABLE IF NOT EXISTS symbols(
   id INTEGER PRIMARY KEY, path TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
   line_start INTEGER NOT NULL, line_end INTEGER NOT NULL, signature TEXT,
-  embedding BLOB, UNIQUE(path,name,line_start));
+  embed_text TEXT, embedding BLOB, UNIQUE(path,name,line_start));
+-- embed_text: the exact string that was embedded at index time (full body
+-- for Python, signature for regex langs). Reindex reads it back so vectors
+-- never silently downgrade to signature-only. Backfilled by migration.
 CREATE INDEX IF NOT EXISTS idx_notes_session ON notes(session_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(content, tags, content='notes', content_rowid='id');
 -- Code reference index (Phase 2): word -> (file, line, context).
@@ -66,6 +69,9 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE notes ADD COLUMN last_recalled INTEGER",
     // Tier lifecycle (plan item 3): every note starts as session-tier.
     "ALTER TABLE notes ADD COLUMN tier TEXT NOT NULL DEFAULT 'session'",
+    // Reindex fidelity: the exact embedded string per symbol (NULL on
+    // legacy DBs — reindex falls back to signature there).
+    "ALTER TABLE symbols ADD COLUMN embed_text TEXT",
 ];
 
 impl Store {
@@ -513,13 +519,14 @@ impl Store {
         Ok(ids)
     }
 
-    /// Query-time tier prior (plan item 3, session-first): fresh session
-    /// context outranks older project knowledge; archived is heavily demoted
-    /// but stays findable on strong lexical/semantic matches.
+    /// Query-time tier prior: proven project knowledge outranks unproven
+    /// session notes (session text is LLM-written and hallucination-prone;
+    /// project tier means recalled 3+ times). Archived stays heavily demoted
+    /// but findable on strong lexical/semantic matches.
     pub fn tier_prior(tier: &str) -> f64 {
         match tier {
-            "session" => 1.25,
-            "project" => 1.0,
+            "project" => 1.25,
+            "session" => 1.0,
             "archived" => 0.25,
             _ => 1.0,
         }
@@ -808,6 +815,39 @@ mod tests {
     }
 
     #[test]
+    fn migration_adds_embed_text_to_legacy_symbols() {
+        // Pre-migration DB: symbols without embed_text; open must add the
+        // column (NULL = legacy) without touching existing rows.
+        let dir = std::env::temp_dir().join(format!(
+            "cx_mig_sym_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("legacy.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE symbols(id INTEGER PRIMARY KEY, path TEXT NOT NULL,
+             name TEXT NOT NULL, kind TEXT NOT NULL, line_start INTEGER NOT NULL,
+             line_end INTEGER NOT NULL, signature TEXT, embedding BLOB);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO symbols(path,name,kind,line_start,line_end,signature)
+             VALUES('a.py','f','function',1,5,'def f():')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let s = Store::open_at(&db.to_string_lossy()).unwrap();
+        let t: Option<String> = s.conn.query_row(
+            "SELECT embed_text FROM symbols LIMIT 1",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(t, None, "legacy rows stay NULL (signature fallback)");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn tier_lifecycle_promote_and_archive() {
         let s = mem();
         let proven = s.add_note("s1", "proven note about caching", "note", &[]).unwrap();
@@ -833,8 +873,8 @@ mod tests {
 
     #[test]
     fn tier_prior_ordering() {
-        assert!(Store::tier_prior("session") > Store::tier_prior("project"));
-        assert!(Store::tier_prior("project") > Store::tier_prior("archived"));
+        assert!(Store::tier_prior("project") > Store::tier_prior("session"));
+        assert!(Store::tier_prior("session") > Store::tier_prior("archived"));
         assert_eq!(Store::tier_prior("unknown"), 1.0);
     }
 

@@ -575,7 +575,7 @@ fn do_recall(task: String, budget: i64, json: bool) -> Result<()> {
     });
     if let Err(e) = provider.health_check() {
         if provider.name() != "hash" && provider.name() != "noop" {
-            return Err(crate::Error::Cli(format!("embedding provider {} unhealthy: {} (hint: run cortex reindex or check config)", provider.name(), e)));
+            return Err(crate::Error::Cli(format!("embedding provider {} unhealthy: {} (hint: start the embedding server (e.g. `ollama serve`), or switch providers with `cortex embeddings use <provider>` + `cortex reindex`)", provider.name(), e)));
         }
     }
     if let Some(db_dim) = store.get_meta("embedding_dim")? {
@@ -1301,7 +1301,7 @@ fn do_index(path: String, embed: String, excludes: Vec<String>) -> Result<()> {
     };
     if let Err(e) = provider.health_check() {
         if provider.name() != "hash" && provider.name() != "noop" {
-            return Err(crate::Error::Cli(format!("embedding provider {} unhealthy: {}", provider.name(), e)));
+            return Err(crate::Error::Cli(format!("embedding provider {} unhealthy: {} (hint: start the embedding server (e.g. `ollama serve`), or switch providers with `cortex embeddings use <provider>` + `cortex reindex`)", provider.name(), e)));
         }
     }
     if let Some(db_dim) = store.get_meta("embedding_dim")? {
@@ -1342,10 +1342,10 @@ fn do_index(path: String, embed: String, excludes: Vec<String>) -> Result<()> {
     if root.is_dir() {
         store.conn.execute("DELETE FROM symbols", [])?;
     }
-    for (rel, name, kind, ls, le, sig, _) in &symbols {
+    for (rel, name, kind, ls, le, sig, embed_text) in &symbols {
         store.conn.execute(
-            "INSERT INTO symbols(path,name,kind,line_start,line_end,signature) VALUES(?1,?2,?3,?4,?5,?6)",
-            rusqlite::params![rel, name, kind, ls, le, sig],
+            "INSERT INTO symbols(path,name,kind,line_start,line_end,signature,embed_text) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            rusqlite::params![rel, name, kind, ls, le, sig, embed_text],
         )?;
     }
     // Phase 2: drain the reference side-map into code_refs_* (no
@@ -1416,7 +1416,10 @@ fn do_reindex(embed: Option<String>) -> Result<()> {
     }
     let mut sym_rows: Vec<(i64, String)> = Vec::new();
     {
-        let mut st = store.conn.prepare("SELECT id, signature FROM symbols")?;
+        // Reindex fidelity: re-embed the exact indexed string; legacy rows
+        // with NULL embed_text fall back to signature (short text — the next
+        // full `index` backfills them).
+        let mut st = store.conn.prepare("SELECT id, COALESCE(embed_text, signature) FROM symbols")?;
         let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         for r in rows { sym_rows.push(r?); }
     }
@@ -1629,6 +1632,38 @@ mod tests {
     }
 
     #[test]
+    fn reindex_reembeds_indexed_text_not_signature() {
+        // Fidelity: reindex must embed the exact indexed string. Hash
+        // embeddings are deterministic, so the blob must be byte-identical
+        // after reindex (signature-only input would change it).
+        let _g = LOCK.lock().unwrap();
+        let dir = temp_dir_with_nanos("cx_reidx_fid");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        run(vec!["cortex".into(), "init".into(), "--embed".into(), "hash".into(), "--yes".into()]).unwrap();
+        let sub = dir.join("proj");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.py"), "def compute(x):\n    \"\"\"Scale the value.\"\"\"\n    return x * 2\n").unwrap();
+        run(vec!["cortex".into(), "index".into(), sub.to_string_lossy().to_string(), "--embed".into(), "hash".into()]).unwrap();
+        let blob1: Vec<u8> = {
+            let store = Store::open_at(dir.join(".cortex/memory.db").to_string_lossy().as_ref()).unwrap();
+            let et: String = store.conn.query_row("SELECT embed_text FROM symbols LIMIT 1", [], |r| r.get(0)).unwrap();
+            assert!(et.contains("return x * 2"), "embed_text must hold the body: {et:?}");
+            store.conn.query_row("SELECT embedding FROM symbols LIMIT 1", [], |r| r.get(0)).unwrap()
+        };
+        run(vec!["cortex".into(), "reindex".into()]).unwrap();
+        let blob2: Vec<u8> = {
+            let store = Store::open_at(dir.join(".cortex/memory.db").to_string_lossy().as_ref()).unwrap();
+            store.conn.query_row("SELECT embedding FROM symbols LIMIT 1", [], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(blob1, blob2, "reindex changed vectors: fidelity broken");
+        std::env::set_current_dir(cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn dim_mismatch_requires_reindex() {
         let _g = LOCK.lock().unwrap();
         let dir = temp_dir_with_nanos("cx_dim_mismatch");
@@ -1645,6 +1680,29 @@ mod tests {
         let msg = res.unwrap_err().to_string();
         assert!(msg.contains("run cortex reindex"), "msg missing hint: {msg}");
         std::env::set_current_dir(cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recall_dead_ollama_points_at_fallback() {
+        let _g = LOCK.lock().unwrap();
+        let dir = temp_dir_with_nanos("cx_dead_ollama");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        run(vec!["cortex".into(), "init".into(), "--embed".into(), "hash".into(), "--yes".into()]).unwrap();
+        // Point config at a dead server (port 9 discard: refused fast).
+        std::fs::write(
+            dir.join(".cortex/config.toml"),
+            "provider = \"ollama\"\ndim = 768\nmodel = \"nomic-embed-text\"\nollama_url = \"http://127.0.0.1:9\"\n",
+        )
+        .unwrap();
+        let res = run(vec!["cortex".into(), "recall".into(), "foo".into(), "--budget".into(), "500".into()]);
+        std::env::set_current_dir(cwd).unwrap();
+        assert!(res.is_err(), "expected unhealthy-provider err, got ok");
+        let msg = res.unwrap_err().to_string();
+        assert!(msg.contains("embeddings use"), "must point at fallback: {msg}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

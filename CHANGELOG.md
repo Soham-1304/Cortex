@@ -56,3 +56,10 @@
   (vanity-task generator; `eval-llm` + bench crate stay the instruments);
   legacy absolute-count generic gate removed (ratio version won, zero
   callers). Net −157/+12 lines. Suites: 103 cortex / 54 bench green.
+- IMPROVE bucket done: (1) tier prior flipped — proven project notes (1.25)
+  now outrank hallucination-prone session notes (1.0), archived still 0.25;
+  (2) reindex fidelity — new `symbols.embed_text` stores the exact indexed
+  string (migration backfills NULL=legacy with signature fallback), so
+  reindex no longer silently downgrades Python vectors to signature-only
+  (byte-identical-blob test); (3) dead-provider errors point at recovery
+  (`ollama serve` or `embeddings use` + `reindex`). Suites: 107/54 green.

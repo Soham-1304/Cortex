@@ -1145,6 +1145,25 @@ mod tests {
     }
 
     #[test]
+    fn tier_prior_prefers_proven_project_note() {
+        let s = Store::open_in_memory().unwrap();
+        s.add_note("sess", "postgres connection pool sizing", "note", &["postgres"]).unwrap();
+        s.add_note("sess", "postgres statement timeout tuning", "note", &["postgres"]).unwrap();
+        s.conn.execute(
+            "UPDATE notes SET tier='project', recall_count=3 WHERE content LIKE '%pool%'",
+            []).unwrap();
+        let cf = CoreFile { path: "x".into(), preamble: None, sections: BTreeMap::new() };
+        let emb = HashEmbedder::new(64);
+        let pay = compile(&s, &cf, &emb, "postgres", 500).unwrap();
+        assert_eq!(pay.memories.len(), 2, "{:?}", pay.memories);
+        assert!(
+            pay.memories[0].content.contains("pool sizing"),
+            "proven project note must outrank session twin: {:?}",
+            pay.memories
+        );
+    }
+
+    #[test]
     fn stale_never_recalled_note_decays() {
         let s = Store::open_in_memory().unwrap();
         s.add_note("sess", "cobol screen scraper notes", "note", &["cobol"]).unwrap();
