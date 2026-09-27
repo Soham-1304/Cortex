@@ -77,3 +77,7 @@
   warning pointing at `cortex index .`; README documents the fresh-keeping
   flow incl. git-hook snippet. Fulfills the pre-existing MCP staleness
   contract in the tool description.
+- Refuted and removed: intent/body cosine split (A-2: docstring+signature vs
+  implementation as separate RRF arms). Django gate: file 0.822->0.793, span
+  0.343->0.316, nDCG -0.052. Splitting halves the evidence per arm while
+  double-counting noisy cosine against BM25. Track A bench work now 0-for-2.
