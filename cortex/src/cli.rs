@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use crate::Result;
 use crate::config::{config_path, global_model_dir, write_config, EmbeddingConfig};
 use crate::corefile::CoreFile;
-use crate::embed::{EmbeddingProvider, HashEmbedder};
+use crate::embed::EmbeddingProvider;
 use crate::session::Session;
 use crate::store::Store;
 use std::path::{Path, PathBuf};
@@ -561,13 +561,10 @@ fn do_remember(content: String, kind: String, entities: Vec<String>, links: Vec<
         }
     }
     let link_refs: Vec<(&str, &str)> = parsed_links.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
-    let provider: Box<dyn EmbeddingProvider> = match crate::embed::registry::load_for_base(&base) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("warning: embedding config load failed ({e}); falling back to hash-64 for write — recall may require reindex after fixing config");
-            Box::new(HashEmbedder::new(64))
-        }
-    };
+    // No silent hash fallback: a 64-dim write into a 768-dim index poisons
+    // recall. Fail loud with the fix.
+    let provider: Box<dyn EmbeddingProvider> = crate::embed::registry::load_for_base(&base)
+        .map_err(|e| crate::Error::Cli(format!("bad embedding config ({e}): run `cortex init --reconfigure`")))?;
     let nid = sess.write(&content, &kind, &entities, &link_refs, provider.as_ref())?;
     println!("{nid}");
     Ok(())
@@ -579,10 +576,9 @@ fn do_recall(task: String, budget: i64, json: bool) -> Result<()> {
     let cp = core_path(&base);
     let store = Store::open_at(&db_path)?;
     let core = CoreFile::load(&cp).unwrap_or_else(|_| CoreFile { path: cp.clone(), preamble: None, sections: Default::default() });
-    let provider: Box<dyn EmbeddingProvider> = crate::embed::registry::load_for_base(&base).unwrap_or_else(|e| {
-        eprintln!("warning: embedding config load failed ({e}); falling back to hash-64 for recall — reindex after fixing config");
-        Box::new(HashEmbedder::new(64))
-    });
+    // No silent hash fallback (see do_remember): mixed dims corrupt ranking.
+    let provider: Box<dyn EmbeddingProvider> = crate::embed::registry::load_for_base(&base)
+        .map_err(|e| crate::Error::Cli(format!("bad embedding config ({e}): run `cortex init --reconfigure`")))?;
     if let Err(e) = provider.health_check() {
         if provider.name() != "hash" && provider.name() != "noop" {
             return Err(crate::Error::Cli(format!("embedding provider {} unhealthy: {} (hint: start the embedding server (e.g. `ollama serve`), or switch providers with `cortex embeddings use <provider>` + `cortex reindex`)", provider.name(), e)));
@@ -1497,10 +1493,9 @@ fn do_index(path: String, embed: String, excludes: Vec<String>) -> Result<()> {
         let cfg = EmbeddingConfig { provider: embed.clone(), dim, model, ollama_url, api_key_env };
         crate::embed::registry::from_config(&cfg)?
     } else {
-        crate::embed::registry::load_for_base(&base).unwrap_or_else(|e| {
-            eprintln!("warning: embedding config load failed ({e}); falling back to hash-64 — reindex after fixing config");
-            Box::new(HashEmbedder::new(64))
-        })
+        // No silent hash fallback (see do_remember).
+        crate::embed::registry::load_for_base(&base)
+            .map_err(|e| crate::Error::Cli(format!("bad embedding config ({e}): run `cortex init --reconfigure`")))?
     };
     if let Err(e) = provider.health_check() {
         if provider.name() != "hash" && provider.name() != "noop" {
@@ -1644,10 +1639,9 @@ fn do_reindex(embed: Option<String>) -> Result<()> {
         let cfg = EmbeddingConfig { provider: e.clone(), dim, model, ollama_url, api_key_env };
         crate::embed::registry::from_config(&cfg)?
     } else {
-        crate::embed::registry::load_for_base(&base).unwrap_or_else(|e| {
-            eprintln!("warning: embedding config load failed ({e}); falling back to hash-64 — reindex after fixing config");
-            Box::new(HashEmbedder::new(64))
-        })
+        // No silent hash fallback (see do_remember).
+        crate::embed::registry::load_for_base(&base)
+            .map_err(|e| crate::Error::Cli(format!("bad embedding config ({e}): run `cortex init --reconfigure`")))?
     };
     provider.health_check()?;
     let mut note_rows: Vec<(i64, String)> = Vec::new();

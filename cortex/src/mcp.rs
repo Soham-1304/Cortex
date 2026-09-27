@@ -2,7 +2,6 @@ use std::io::{BufRead, BufReader, Write};
 use serde_json::{json, Value};
 use crate::Result;
 use crate::corefile::CoreFile;
-use crate::embed::HashEmbedder;
 use crate::session::Session;
 use crate::store::Store;
 use std::path::Path;
@@ -165,10 +164,8 @@ fn dispatch(name: &str, args: &Value, id: Value) -> Value {
                 let cp = core_path();
                 let core = CoreFile::load(&cp).unwrap_or_else(|_| CoreFile { path: cp.clone(), preamble: None, sections: Default::default() });
                 let base = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-                let provider: Box<dyn crate::embed::EmbeddingProvider> = crate::embed::registry::load_for_base(&base).unwrap_or_else(|e| {
-                    eprintln!("warning: embedding config load failed ({e}); falling back to hash-64 — reindex after fixing config");
-                    Box::new(HashEmbedder::new(64))
-                });
+                // No silent hash fallback: mixed dims corrupt ranking. Fail loud.
+                let provider: Box<dyn crate::embed::EmbeddingProvider> = crate::embed::registry::load_for_base(&base).map_err(|e| format!("bad embedding config ({e}): run `cortex init --reconfigure`"))?;
                 if let Some(db_dim) = store.get_meta("embedding_dim").map_err(|e| e.to_string())? {
                     if db_dim != provider.dim().to_string() {
                         return Err(format!("embedding dim mismatch (db={}, config={}): run cortex reindex", db_dim, provider.dim()));
@@ -214,13 +211,8 @@ fn dispatch(name: &str, args: &Value, id: Value) -> Value {
                 let sid = session_id();
                 let mut sess = Session::start(&store, &sid).map_err(|e| e.to_string())?;
                 let base = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
-                let provider: Box<dyn crate::embed::EmbeddingProvider> = match crate::embed::registry::load_for_base(&base) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        eprintln!("warning: embedding config load failed ({e}); falling back to hash-64 for write — recall may require reindex after fixing config");
-                        Box::new(HashEmbedder::new(64))
-                    }
-                };
+                // No silent hash fallback (see compile_context above).
+                let provider: Box<dyn crate::embed::EmbeddingProvider> = crate::embed::registry::load_for_base(&base).map_err(|e| format!("bad embedding config ({e}): run `cortex init --reconfigure`"))?;
                 let nid = sess.write(&content, &kind, &entities, &link_refs, provider.as_ref()).map_err(|e| e.to_string())?;
                 Ok(json!({"id": nid}).to_string())
             }
@@ -270,10 +262,7 @@ fn dispatch(name: &str, args: &Value, id: Value) -> Value {
                     let cfg = crate::config::EmbeddingConfig { provider: e.clone(), dim, model, ollama_url: None, api_key_env: None };
                     crate::embed::registry::from_config(&cfg).map_err(|e| e.to_string())?
                 } else {
-                    crate::embed::registry::load_for_base(&base).unwrap_or_else(|e| {
-                        eprintln!("warning: embedding config load failed ({e}); falling back to hash-64 — reindex after fixing config");
-                        Box::new(HashEmbedder::new(64))
-                    })
+                    crate::embed::registry::load_for_base(&base).map_err(|e| format!("bad embedding config ({e}): run `cortex init --reconfigure`"))?
                 };
                 provider.health_check().map_err(|e| e.to_string())?;
                 let mut note_rows: Vec<(i64, String)> = Vec::new();

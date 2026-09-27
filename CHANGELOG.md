@@ -96,3 +96,9 @@
   `feedback` tool. Useful reuses recall reinforcement; useless decrements
   recall_count (floor 0, reversible — no sticky archive). Unknown ids error.
   Exposure is now tempered by outcomes. CLI+MCP smoke-verified.
+- Silent 64-dim hash fallbacks removed everywhere (CLI remember/recall/
+  index/reindex, MCP compile/write/reindex): bad config now fails loud with
+  the `init --reconfigure` fix instead of poisoning rankings with mixed
+  dims. Explicit `--embed hash` untouched. Correction: the "drift" alarm
+  was a raw-vs-pooled metric mixup on my side — probe repeats agree
+  exactly, harness is deterministic, no query-cache fix needed.
