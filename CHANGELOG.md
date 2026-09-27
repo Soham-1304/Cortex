@@ -81,3 +81,10 @@
   implementation as separate RRF arms). Django gate: file 0.822->0.793, span
   0.343->0.316, nDCG -0.052. Splitting halves the evidence per arm while
   double-counting noisy cosine against BM25. Track A bench work now 0-for-2.
+- Weight thread closed per owner order (pool sweep kept as evidence, leg
+  triplet killed mid-run and reverted): pool depth saturates at 10
+  (15/20/30 == 0.8224 file) with a file<->span trade at pool=5 (file 0.72,
+  span 0.38). Integrity warning: a default-weight rerun printed file 0.791
+  vs 0.822 baseline with identical nDCG — suspected live query-embedding
+  nondeterminism; fine-grained bench deltas need a repeatability probe
+  before any weight conclusion.
