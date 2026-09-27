@@ -102,3 +102,8 @@
   dims. Explicit `--embed hash` untouched. Correction: the "drift" alarm
   was a raw-vs-pooled metric mixup on my side — probe repeats agree
   exactly, harness is deterministic, no query-cache fix needed.
+- Refuted and removed: hierarchical file->functions quotas (round-robin
+  top-K files x top-M members over fused ranking). Django grid: best file
+  +0.008 (noise), span down everywhere (10,2/10,4: -0.076). Round-robin
+  swaps flat ranks ~11-20 (often gold same-file neighbors) for weak files'
+  bests; quotas over wrong file order just re-exclude. Pool stays.
