@@ -75,6 +75,15 @@ enum Cmd {
         #[arg(long, default_value="0")]
         tokens: i64,
     },
+    /// Agent feedback on a recalled note: `useful` strengthens (same path
+    /// as recall reinforcement), `useless` reversibly distrusts
+    /// (recall_count - 1, floor 0). The usefulness signal reinforcement
+    /// was missing: exposure is now tempered by outcomes.
+    Feedback {
+        id: i64,
+        #[arg(value_parser = ["useful", "useless"])]
+        verdict: String,
+    },
     Index {
         path: String,
         #[arg(long, default_value="hash")]
@@ -161,6 +170,7 @@ pub fn run(argv: Vec<String>) -> Result<()> {
         Cmd::Map { query, json } => do_map(query, json),
         Cmd::Tiers { promote_min, archive_days } => do_tiers(promote_min, archive_days),
         Cmd::Digest { summary, tokens } => do_digest(summary, tokens),
+        Cmd::Feedback { id, verdict } => do_feedback(id, verdict),
         Cmd::Index { path, embed, exclude } => do_index(path, embed, exclude),
         Cmd::Reindex { embed } => do_reindex(embed),
         Cmd::Core { sub } => match sub {
@@ -664,6 +674,29 @@ fn do_eval_llm(
     } else {
         crate::agentic_llm::print_llm_report(&report);
     }
+    Ok(())
+}
+
+fn do_feedback(id: i64, verdict: String) -> Result<()> {
+    let base = current_base();
+    let store = Store::open_at(&store_path(&base))?;
+    let exists: i64 = store
+        .conn
+        .query_row("SELECT count(*) FROM notes WHERE id=?1", [id], |r| r.get(0))?;
+    if exists == 0 {
+        return Err(crate::Error::Cli(format!("unknown note id {id}")));
+    }
+    match verdict.as_str() {
+        "useful" => {
+            store.reinforce_recalled(&[id])?;
+            println!("reinforced note {id}");
+        }
+        _ => {
+            store.demote_feedback(&[id])?;
+            println!("demoted note {id}");
+        }
+    }
+    crate::store::checkpoint(&store)?;
     Ok(())
 }
 
@@ -1892,6 +1925,35 @@ mod tests {
             store.conn.query_row("SELECT embedding FROM symbols LIMIT 1", [], |r| r.get(0)).unwrap()
         };
         assert_eq!(blob1, blob2, "reindex changed vectors: fidelity broken");
+        std::env::set_current_dir(cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn feedback_useful_and_useless_roundtrip() {
+        let _g = LOCK.lock().unwrap();
+        let dir = temp_dir_with_nanos("cx_feedback");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        run(vec!["cortex".into(), "init".into(), "--embed".into(), "hash".into(), "--yes".into()]).unwrap();
+        run(vec!["cortex".into(), "remember".into(), "cache ttl is 60s".into()]).unwrap();
+        let db = dir.join(".cortex/memory.db").to_string_lossy().to_string();
+        let nid: i64 = {
+            let store = Store::open_at(&db).unwrap();
+            store.conn.query_row("SELECT id FROM notes LIMIT 1", [], |r| r.get(0)).unwrap()
+        };
+        let rc = |db: &str| -> i64 {
+            let store = Store::open_at(db).unwrap();
+            store.conn.query_row("SELECT recall_count FROM notes LIMIT 1", [], |r| r.get(0)).unwrap()
+        };
+        run(vec!["cortex".into(), "feedback".into(), nid.to_string(), "useful".into()]).unwrap();
+        assert_eq!(rc(&db), 1);
+        run(vec!["cortex".into(), "feedback".into(), nid.to_string(), "useless".into()]).unwrap();
+        assert_eq!(rc(&db), 0);
+        let bad = run(vec!["cortex".into(), "feedback".into(), "424242".into(), "useless".into()]);
+        assert!(bad.is_err(), "unknown id must error");
         std::env::set_current_dir(cwd).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -89,6 +89,18 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "feedback",
+            "description": "Rate a recalled note: useful strengthens it, useless distrusts it (reversible).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "note_id": {"type": "number"},
+                    "verdict": {"type": "string", "enum": ["useful", "useless"]}
+                },
+                "required": ["note_id", "verdict"]
+            }
+        },
+        {
             "name": "reindex",
             "description": "Re-embed all notes and symbols after changing embedding provider/dim.",
             "inputSchema": {
@@ -295,6 +307,24 @@ fn dispatch(name: &str, args: &Value, id: Value) -> Value {
                 store.set_meta("embedding_dim", &provider.dim().to_string()).map_err(|e| e.to_string())?;
                 Ok(json!({"reindexed": true, "notes": note_rows.len(), "symbols": sym_rows.len()}).to_string())
             }
+            "feedback" => {
+                let id = args.get("note_id").and_then(|v| v.as_i64()).ok_or("missing note_id")?;
+                let verdict = args.get("verdict").and_then(|v| v.as_str()).ok_or("missing verdict")?;
+                if verdict != "useful" && verdict != "useless" {
+                    return Err(format!("verdict must be useful|useless, got {verdict}"));
+                }
+                let store = open_store().map_err(|e| e.to_string())?;
+                let exists: i64 = store.conn.query_row("SELECT count(*) FROM notes WHERE id=?1", [id], |r| r.get(0)).map_err(|e| e.to_string())?;
+                if exists == 0 {
+                    return Err(format!("unknown note id {id}"));
+                }
+                if verdict == "useful" {
+                    store.reinforce_recalled(&[id]).map_err(|e| e.to_string())?;
+                } else {
+                    store.demote_feedback(&[id]).map_err(|e| e.to_string())?;
+                }
+                Ok(json!({"id": id, "verdict": verdict}).to_string())
+            }
             _ => Err(format!("unknown tool {name}")),
         }
     })();
@@ -343,7 +373,7 @@ pub fn run_stdio() -> Result<()> {
                 let params = req.get("params").cloned().unwrap_or(Value::Null);
                 let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                let known = ["compile_context","memory_write","memory_search","session_digest","core_read","core_write","reindex"];
+                let known = ["compile_context","memory_write","memory_search","session_digest","core_read","core_write","feedback","reindex"];
                 if !known.contains(&name.as_str()) {
                     let text = json!({"error": format!("unknown tool {name}")}).to_string();
                     json!({"jsonrpc":"2.0","id":uid,"result":{"content":[{"type":"text","text":text}],"isError":true}})

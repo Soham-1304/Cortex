@@ -468,6 +468,21 @@ impl Store {
         Ok(())
     }
 
+    /// Explicit agent feedback (usefulness signal): a `useless` verdict
+    /// decrements recall_count (floor 0), reversibly distrusting a note
+    /// that misled — no stickiness, future recalls re-promote. `useful`
+    /// reuses `reinforce_recalled`. Returns affected rows (0 = unknown id).
+    pub fn demote_feedback(&self, note_ids: &[i64]) -> Result<usize> {
+        let mut n = 0usize;
+        for id in note_ids {
+            n += self.conn.execute(
+                "UPDATE notes SET recall_count = CASE WHEN recall_count > 0 THEN recall_count - 1 ELSE 0 END WHERE id=?1",
+                params![id],
+            )? as usize;
+        }
+        Ok(n)
+    }
+
     /// Query-time reinforcement factor for a note (plan item 2):
     /// `f(recall_count) = 1 + ln(1 + recall_count)`. Logarithmic so repeated
     /// recall has diminishing returns (a note recalled 10× isn't 10× better).
@@ -766,6 +781,23 @@ mod tests {
         let rc2: i64 = s.conn.query_row(
             "SELECT recall_count FROM notes WHERE id=?1", [id], |r| r.get(0)).unwrap();
         assert_eq!(rc2, 2);
+    }
+
+    #[test]
+    fn feedback_demote_floors_and_counts() {
+        let s = mem();
+        let id = s.add_note("ses1", "flaky claim here", "note", &[]).unwrap();
+        assert_eq!(s.demote_feedback(&[id, 999999]).unwrap(), 1, "only real rows count");
+        assert_eq!(s.demote_feedback(&[id]).unwrap(), 1, "floor 0 still matches row");
+        let rc: i64 = s.conn.query_row(
+            "SELECT recall_count FROM notes WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(rc, 0, "never below zero");
+        s.reinforce_recalled(&[id]).unwrap();
+        s.reinforce_recalled(&[id]).unwrap();
+        s.demote_feedback(&[id]).unwrap();
+        let rc2: i64 = s.conn.query_row(
+            "SELECT recall_count FROM notes WHERE id=?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(rc2, 1, "2 up, 1 down");
     }
 
     #[test]

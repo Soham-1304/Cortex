@@ -92,3 +92,7 @@
   agent task-success on real issues. Span >0.70 retired as a gate (0-for-2
   spikes + saturating weights say lexical+vector+graph won't 2x it); span
   stays a diagnostic. Remaining retrieval job: django -0.08, sympy -0.15.
+- Usefulness signal (thread 3): `cortex feedback <id> useful|useless` + MCP
+  `feedback` tool. Useful reuses recall reinforcement; useless decrements
+  recall_count (floor 0, reversible — no sticky archive). Unknown ids error.
+  Exposure is now tempered by outcomes. CLI+MCP smoke-verified.
