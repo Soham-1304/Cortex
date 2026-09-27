@@ -353,50 +353,11 @@ impl EmbeddingProvider for GoogleProvider {
         }
     }
 }
-pub struct CohereProvider {
-    pub dim: usize,
-    pub api_key_env: String,
-}
-impl CohereProvider {
-    pub fn new(cfg: &crate::config::EmbeddingConfig) -> Result<Self> {
-        Ok(Self {
-            dim: cfg.dim,
-            api_key_env: cfg
-                .api_key_env
-                .clone()
-                .unwrap_or("COHERE_API_KEY".into()),
-        })
-    }
-}
-impl EmbeddingProvider for CohereProvider {
-    fn name(&self) -> &str {
-        "cohere"
-    }
-    fn dim(&self) -> usize {
-        self.dim
-    }
-    fn is_local(&self) -> bool {
-        false
-    }
-    fn embed(&self, _texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        Err(crate::Error::Cli("cohere provider not yet wired (T3)".into()))
-    }
-    fn health_check(&self) -> Result<()> {
-        if std::env::var(&self.api_key_env).is_ok() {
-            Ok(())
-        } else {
-            Err(crate::Error::Cli(format!(
-                "env {} not set",
-                self.api_key_env
-            )))
-        }
-    }
-}
 pub mod registry {
     use crate::config::EmbeddingConfig;
     use crate::embed::{
-        CohereProvider, EmbeddingProvider, GoogleProvider, HashEmbedder, LocalNomicEmbedder,
-        NoOpEmbedder, OllamaProvider, OpenAIProvider,
+        EmbeddingProvider, GoogleProvider, HashEmbedder, LocalNomicEmbedder, NoOpEmbedder,
+        OllamaProvider, OpenAIProvider,
     };
     use crate::Result;
     pub fn from_config(cfg: &EmbeddingConfig) -> Result<Box<dyn EmbeddingProvider>> {
@@ -414,7 +375,6 @@ pub mod registry {
             "local-nomic" => Ok(Box::new(LocalNomicEmbedder::new(cfg)?)),
             "openai" => Ok(Box::new(OpenAIProvider::new(cfg)?)),
             "google" => Ok(Box::new(GoogleProvider::new(cfg)?)),
-            "cohere" => Ok(Box::new(CohereProvider::new(cfg)?)),
             other => Err(crate::Error::Cli(format!("unknown provider {other}"))),
         }
     }

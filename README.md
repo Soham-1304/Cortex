@@ -203,10 +203,12 @@ cortex reindex
 
 ### Agentic Evaluation
 
-Cortex includes a built-in automated A/B evaluation harness comparing an unassisted agentic baseline loop against a Cortex-backed agent:
+Retrieval is measured by the `bench` crate on real-issue benchmarks
+(astropy/django/sympy). For a live LLM check with real tool calls:
 
 ```bash
-cortex eval --json --out eval_results.json
+export OPENROUTER_API_KEY=sk-or-...
+cortex eval-llm --json --out eval_results.json
 ```
 
 ---

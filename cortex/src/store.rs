@@ -247,22 +247,6 @@ impl Store {
         Ok((defs, uses, fts))
     }
 
-    /// True when `name` is defined or used across many files — i.e. it is a
-    /// generic identifier (a prose word colliding with a hyper-common code
-    /// name like `data`, or a one-letter loop variable) carrying no
-    /// navigation signal for the refs leg. Case-insensitive: the query
-    /// tokens are lowercased at tokenize time while the index stores raw
-    /// source case (`FITSDiff` vs `fitsdiff`).
-    pub fn refs_name_is_generic(&self, name: &str, max_files: usize) -> Result<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT (SELECT COUNT(DISTINCT path) FROM code_refs_def WHERE name = ?1 COLLATE NOCASE)
-                  + (SELECT COUNT(DISTINCT path) FROM code_refs_use WHERE name = ?1 COLLATE NOCASE)",
-            rusqlite::params![name],
-            |r| r.get(0),
-        )?;
-        Ok(n as usize >= max_files)
-    }
-
     /// IDF weight for a refs-leg token: `ln(1 + total_files / df_files)`.
     /// `df_files` counts distinct files matching the token by exact name
     /// OR FTS (name+context) — i.e. the same retrieval universe the refs
@@ -616,33 +600,6 @@ mod tests {
         assert!(s.search_notes("", 5).unwrap().is_empty());
     }
     #[test]
-    fn refs_name_is_generic_flags_file_saturation() {
-        let s = mem();
-        for i in 0..9 {
-            let p = format!("f{i}.py");
-            s.conn
-                .execute(
-                    "INSERT INTO code_refs_use(path,name,kind,line,context,target)
-                     VALUES(?1,'data','call',1,'ctx',NULL)",
-                    rusqlite::params![p],
-                )
-                .unwrap();
-        }
-        // 9 distinct files exceed the default gate threshold (8).
-        assert!(s.refs_name_is_generic("data", 8).unwrap());
-        // A rare name in one file stays specific.
-        s.conn
-            .execute(
-                "INSERT INTO code_refs_use(path,name,kind,line,context,target)
-                 VALUES('x.py','fits_diff','call',1,'ctx',NULL)",
-                [],
-            )
-            .unwrap();
-        assert!(!s.refs_name_is_generic("fits_diff", 8).unwrap());
-        // Strict threshold: 2 files trip max_files=2.
-        assert!(s.refs_name_is_generic("fits_diff", 1).unwrap());
-    }
-    #[test]
     fn find_refs_is_case_insensitive() {
         let s = mem();
         s.index_code_refs(
@@ -654,7 +611,6 @@ mod tests {
         // raw source case. Exact arm must still hit.
         let (d, _, _) = s.find_refs("fitsdiff", 5).unwrap();
         assert_eq!(d.len(), 1, "lowercase query must hit CamelCase def");
-        assert!(!s.refs_name_is_generic("fitsdiff", 8).unwrap());
     }
     #[test]
     fn generic_ratio_scales_with_repo_size() {

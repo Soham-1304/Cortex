@@ -104,26 +104,6 @@ enum Cmd {
         #[command(subcommand)]
         sub: EmbedCmd,
     },
-    Eval {
-        #[arg(long, default_value = "48")]
-        docs: usize,
-        #[arg(long, default_value = "24")]
-        tasks: usize,
-        #[arg(long, default_value = "42")]
-        seed: u64,
-        #[arg(long, default_value = "2000")]
-        budget: i64,
-        #[arg(long, default_value = "120")]
-        per_turn: i64,
-        #[arg(long, default_value = "8")]
-        max_turns: usize,
-        #[arg(long, default_value = "3")]
-        distractors: usize,
-        #[arg(long)]
-        json: bool,
-        #[arg(long)]
-        out: Option<String>,
-    },
     #[command(name="eval-llm", about="Real LLM agentic A/B via OpenRouter (needs OPENROUTER_API_KEY)")]
     EvalLlm {
         #[arg(long, default_value = "12")]
@@ -189,18 +169,6 @@ pub fn run(argv: Vec<String>) -> Result<()> {
         },
         Cmd::Serve { stdio } => do_serve(stdio),
         Cmd::Status => do_status(),
-        Cmd::Eval { docs, tasks, seed, budget, per_turn, max_turns, distractors, json, out } => {
-            let cfg = crate::agentic::HarnessConfig {
-                docs,
-                tasks,
-                seed,
-                budget,
-                per_turn,
-                max_turns,
-                distractors,
-            };
-            do_eval(cfg, json, out)
-        }
         Cmd::EvalLlm { tasks, seed, model, budget, per_turn, distractors, json, out } => {
             let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
             if api_key.trim().is_empty() {
@@ -266,7 +234,6 @@ fn provider_dim(provider: &str) -> usize {
         "ollama" => 768,
         "google" => 768,
         "openai" => 3072,
-        "cohere" => 1024,
         "hash" => 64,
         "noop" => 64,
         _ => 64,
@@ -279,7 +246,6 @@ fn provider_model(provider: &str) -> String {
         "ollama" => "nomic-embed-text".to_string(),
         "openai" => "text-embedding-3-large".to_string(),
         "google" => "text-embedding-004".to_string(),
-        "cohere" => "embed-english-v3".to_string(),
         "hash" => "hash".to_string(),
         "noop" => "noop".to_string(),
         _ => provider.to_string(),
@@ -287,7 +253,7 @@ fn provider_model(provider: &str) -> String {
 }
 
 fn validate_provider(p: &str) -> Result<()> {
-    const KNOWN: &[&str] = &["local-nomic", "ollama", "openai", "google", "cohere", "hash", "noop"];
+    const KNOWN: &[&str] = &["local-nomic", "ollama", "openai", "google", "hash", "noop"];
     if KNOWN.contains(&p) {
         Ok(())
     } else {
@@ -421,23 +387,16 @@ fn do_init(path: Option<String>, embed: Option<String>, reconfigure: bool, yes: 
                 return Err(crate::Error::Cli("api key env var cannot be empty".into()));
             }
             api_env = Some(v);
-        } else if provider == "cohere" {
-            let v = inquire::Text::new("env var for API key").with_default("COHERE_API_KEY").prompt().map_err(|e| crate::Error::Cli(e.to_string()))?;
-            if v.trim().is_empty() {
-                return Err(crate::Error::Cli("api key env var cannot be empty".into()));
-            }
-            api_env = Some(v);
         }
         if provider == "hash" && !yes {
             return Err(crate::Error::Cli("hash provider requires --yes".into()));
         }
-        if provider == "openai" || provider == "google" || provider == "cohere" {
+        if provider == "openai" || provider == "google" {
             let dim = provider_dim(provider);
             let model = provider_model(provider);
             let default_env = match provider {
                 "openai" => "OPENAI_API_KEY",
-                "google" => "GOOGLE_API_KEY",
-                _ => "COHERE_API_KEY",
+                _ => "GOOGLE_API_KEY",
             };
             let env_name = api_env.unwrap_or_else(|| default_env.to_string());
             let cfg_tmp = EmbeddingConfig { provider: provider.to_string(), dim, model, ollama_url: None, api_key_env: Some(env_name) };
@@ -467,7 +426,6 @@ fn do_init(path: Option<String>, embed: Option<String>, reconfigure: bool, yes: 
         "ollama" => (Some("http://localhost:11434".to_string()), None),
         "openai" => (None, Some("OPENAI_API_KEY".to_string())),
         "google" => (None, Some("GOOGLE_API_KEY".to_string())),
-        "cohere" => (None, Some("COHERE_API_KEY".to_string())),
         _ => (None, None),
     };
     let cfg = EmbeddingConfig { provider: provider_choice.clone(), dim, model, ollama_url, api_key_env };
@@ -502,12 +460,12 @@ fn do_embeddings_list() -> Result<()> {
     let base = current_base();
     let cfg_path = config_path(&base);
     let cfg = std::fs::read_to_string(&cfg_path).ok().and_then(|s| toml::from_str::<EmbeddingConfig>(&s).ok()).unwrap_or_default();
-    let providers = ["local-nomic", "ollama", "openai", "google", "cohere", "hash", "noop"];
+    let providers = ["local-nomic", "ollama", "openai", "google", "hash", "noop"];
     println!("providers:");
     for p in providers {
         let active = if cfg.provider == p { "*" } else { " " };
         let dim = if cfg.provider == p { cfg.dim } else { provider_dim(p) };
-        let tmp_cfg = EmbeddingConfig { provider: p.to_string(), dim, model: provider_model(p), ollama_url: if p == "ollama" { Some("http://localhost:11434".to_string()) } else { None }, api_key_env: match p { "openai" => Some("OPENAI_API_KEY".to_string()), "google" => Some("GOOGLE_API_KEY".to_string()), "cohere" => Some("COHERE_API_KEY".to_string()), _ => None } };
+        let tmp_cfg = EmbeddingConfig { provider: p.to_string(), dim, model: provider_model(p), ollama_url: if p == "ollama" { Some("http://localhost:11434".to_string()) } else { None }, api_key_env: match p { "openai" => Some("OPENAI_API_KEY".to_string()), "google" => Some("GOOGLE_API_KEY".to_string()), _ => None } };
         let status = match crate::embed::registry::from_config(&tmp_cfg) {
             Ok(prov) => match prov.health_check() { Ok(()) => "ok", Err(_) => "missing" },
             Err(_) => "unknown",
@@ -565,7 +523,6 @@ fn do_embeddings_use(provider: String, model: Option<String>, ollama_url: Option
         cfg.api_key_env = match provider.as_str() {
             "openai" => Some("OPENAI_API_KEY".to_string()),
             "google" => Some("GOOGLE_API_KEY".to_string()),
-            "cohere" => Some("COHERE_API_KEY".to_string()),
             _ => None,
         };
     }
@@ -678,24 +635,6 @@ fn do_recall(task: String, budget: i64, json: bool) -> Result<()> {
             println!("{} {}:{} {}", s.path, s.line_start, s.line_end, s.name);
         }
         println!("tokens_used={} rho={:.3}", payload.tokens_used, payload.rho_naive);
-    }
-    Ok(())
-}
-
-fn do_eval(
-    cfg: crate::agentic::HarnessConfig,
-    json: bool,
-    out: Option<String>,
-) -> Result<()> {
-    let report = crate::agentic::run_harness(&cfg)?;
-    if let Some(p) = &out {
-        std::fs::write(p, serde_json::to_string_pretty(&report)?)?;
-        eprintln!("wrote {p}");
-    }
-    if json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
-    } else {
-        crate::agentic::print_report(&report);
     }
     Ok(())
 }
@@ -1350,7 +1289,6 @@ fn do_index(path: String, embed: String, excludes: Vec<String>) -> Result<()> {
             "ollama" => (Some("http://localhost:11434".to_string()), None),
             "openai" => (None, Some("OPENAI_API_KEY".to_string())),
             "google" => (None, Some("GOOGLE_API_KEY".to_string())),
-            "cohere" => (None, Some("COHERE_API_KEY".to_string())),
             _ => (None, None),
         };
         let cfg = EmbeddingConfig { provider: embed.clone(), dim, model, ollama_url, api_key_env };
@@ -1459,7 +1397,6 @@ fn do_reindex(embed: Option<String>) -> Result<()> {
             "ollama" => (Some("http://localhost:11434".to_string()), None),
             "openai" => (None, Some("OPENAI_API_KEY".to_string())),
             "google" => (None, Some("GOOGLE_API_KEY".to_string())),
-            "cohere" => (None, Some("COHERE_API_KEY".to_string())),
             _ => (None, None),
         };
         let cfg = EmbeddingConfig { provider: e.clone(), dim, model, ollama_url, api_key_env };

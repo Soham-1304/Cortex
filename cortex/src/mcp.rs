@@ -250,7 +250,7 @@ fn dispatch(name: &str, args: &Value, id: Value) -> Value {
                 let db_path = base.join(".cortex/memory.db");
                 let store = Store::open_at(&db_path.to_string_lossy()).map_err(|e| e.to_string())?;
                 let provider: Box<dyn crate::embed::EmbeddingProvider> = if let Some(e) = embed {
-                    let dim = match e.as_str() { "local-nomic"|"ollama"|"google" => 768, "openai" => 3072, "cohere" => 1024, _ => 64 };
+                    let dim = match e.as_str() { "local-nomic"|"ollama"|"google" => 768, "openai" => 3072, _ => 64 };
                     let model = e.clone();
                     let cfg = crate::config::EmbeddingConfig { provider: e.clone(), dim, model, ollama_url: None, api_key_env: None };
                     crate::embed::registry::from_config(&cfg).map_err(|e| e.to_string())?

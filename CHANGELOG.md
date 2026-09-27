@@ -51,3 +51,8 @@
   file 0.822→0.8095, span 0.343→0.337, nDCG −0.026 — down on every metric.
   Comments share generic vocab / inflate costs; no signal. Fixture restored,
   code fully reverted.
+- REMOVE bucket done: Cohere stub provider (menu offered it, always errored)
+  deleted from registry/CLI/MCP; synthetic `cortex eval` CLI removed
+  (vanity-task generator; `eval-llm` + bench crate stay the instruments);
+  legacy absolute-count generic gate removed (ratio version won, zero
+  callers). Net −157/+12 lines. Suites: 103 cortex / 54 bench green.
