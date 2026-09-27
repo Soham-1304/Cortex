@@ -31,6 +31,9 @@ CREATE TABLE IF NOT EXISTS symbols(
   id INTEGER PRIMARY KEY, path TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL,
   line_start INTEGER NOT NULL, line_end INTEGER NOT NULL, signature TEXT,
   embed_text TEXT, embedding BLOB, UNIQUE(path,name,line_start));
+CREATE TABLE IF NOT EXISTS indexed_files(
+  path TEXT PRIMARY KEY, mtime INTEGER NOT NULL, content_hash TEXT NOT NULL,
+  sym_count INTEGER NOT NULL DEFAULT 0);
 -- embed_text: the exact string that was embedded at index time (full body
 -- for Python, signature for regex langs). Reindex reads it back so vectors
 -- never silently downgrade to signature-only. Backfilled by migration.
@@ -947,6 +950,32 @@ mod tests {
         assert!(d.is_empty() && u.is_empty() && f.is_empty());
         let (d2, u2, _) = s.find_refs("foo-bar junk\"quote", 5).unwrap();
         assert!(d2.is_empty() && u2.is_empty());
+    }
+
+    #[test]
+    fn indexed_files_table_present_on_legacy_open() {
+        // Pre-ledger DB (notes only): open must create `indexed_files`
+        // empty — same CREATE-IF-NOT-EXISTS precedent as code_refs_*.
+        let dir = std::env::temp_dir().join(format!(
+            "cx_idxfmig_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let db = dir.join("legacy.db");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE notes(id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+             content TEXT NOT NULL, kind TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]',
+             created_at INTEGER NOT NULL, embedding BLOB);",
+        ).unwrap();
+        drop(conn);
+        let s = Store::open_at(&db.to_string_lossy()).unwrap();
+        let n: i64 = s.conn.query_row(
+            "SELECT count(*) FROM indexed_files",
+            [], |r| r.get(0)).unwrap();
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

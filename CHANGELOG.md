@@ -63,3 +63,7 @@
   reindex no longer silently downgrades Python vectors to signature-only
   (byte-identical-blob test); (3) dead-provider errors point at recovery
   (`ollama serve` or `embeddings use` + `reindex`). Suites: 107/54 green.
+- B-1 auto-index foundation: `indexed_files(path,mtime,hash,sym_count)` ledger
+  written at index time (+walk-root meta, dead-row sweep), `status` reports
+  clean/dirty/missing/untracked. Live-verified: edit+add+re-index cycle
+  reports correctly. Triggers/watcher deferred to B-2.

@@ -1153,6 +1153,118 @@ fn ignored_by(rel: &str, pats: &[String]) -> bool {
     false
 }
 
+/// FNV-1a hex over file text — change detection for freshness tracking.
+/// Std-only (matches the query_hash precedent in `events.rs`).
+fn fnv_hex(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
+fn file_mtime_secs(md: &std::fs::Metadata) -> i64 {
+    md.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Freshness of the on-disk tree vs the last index (B-1: detect + report;
+/// refresh triggers land in B-2). `--exclude` flags are NOT persisted at
+/// index time, so untracked counts ignore them; dirty/missing read the DB
+/// rows and are exact regardless.
+struct FreshReport {
+    indexed: usize,
+    dirty: Vec<String>,
+    missing: Vec<String>,
+    untracked: usize,
+}
+
+fn check_freshness(store: &Store, root: &Path) -> FreshReport {
+    let mut rows: Vec<(String, i64, String)> = Vec::new();
+    if let Ok(mut st) = store
+        .conn
+        .prepare("SELECT path, mtime, content_hash FROM indexed_files")
+    {
+        if let Ok(mapped) = st.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        }) {
+            rows = mapped.flatten().collect();
+        }
+    }
+    let mut indexed_set = std::collections::HashSet::new();
+    let mut dirty = Vec::new();
+    let mut missing = Vec::new();
+    for (rel, mt, hash) in &rows {
+        indexed_set.insert(rel.clone());
+        match std::fs::read_to_string(root.join(rel)).ok() {
+            None => missing.push(rel.clone()),
+            Some(text) => {
+                let cur_mt = std::fs::metadata(root.join(rel))
+                    .map(|m| file_mtime_secs(&m))
+                    .unwrap_or(-1);
+                if cur_mt != *mt || fnv_hex(&text) != *hash {
+                    dirty.push(rel.clone());
+                }
+            }
+        }
+    }
+    // Untracked: same skip rules as indexing (minus unpersisted excludes).
+    let gitignore = load_gitignore(root);
+    let mut untracked = 0usize;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for ent in entries.flatten() {
+            let p = ent.path();
+            let fname = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            if p.is_dir() {
+                if SKIP_DIRS.contains(&fname) {
+                    continue;
+                }
+                if fname.starts_with('.') && (fname == ".git" || fname == ".cortex") {
+                    continue;
+                }
+                stack.push(p);
+            } else {
+                let ext = p
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| format!(".{s}"))
+                    .unwrap_or_default();
+                if !EXTS.contains(&ext.to_lowercase().as_str()) {
+                    continue;
+                }
+                let rel = p
+                    .strip_prefix(root)
+                    .unwrap_or(&p)
+                    .to_string_lossy()
+                    .to_string()
+                    .replace('\\', "/");
+                if ignored_by(&rel, &gitignore) {
+                    continue;
+                }
+                if !indexed_set.contains(&rel) {
+                    untracked += 1;
+                }
+            }
+        }
+    }
+    dirty.sort();
+    missing.sort();
+    FreshReport { indexed: rows.len(), dirty, missing, untracked }
+}
+
 fn extract_symbols(root: &Path, excludes: &[String]) -> (Vec<SymbolRow>, RefIndex) {
     let mut out = Vec::new();
     let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -1160,6 +1272,10 @@ fn extract_symbols(root: &Path, excludes: &[String]) -> (Vec<SymbolRow>, RefInde
     // Phase 2/3 reference index: per-file (defs, uses) collected during the
     // same walk. Kept in a side map so the symbols return type is untouched.
     let mut refs: std::collections::HashMap<String, (RefDefsVec, RefUsesVec)> =
+        std::collections::HashMap::new();
+    // Freshness ledger input: per-file (mtime, content hash) captured during
+    // the same walk, drained into `indexed_files` by `do_index`.
+    let mut filemeta: std::collections::HashMap<String, (i64, String)> =
         std::collections::HashMap::new();
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -1224,7 +1340,9 @@ fn extract_symbols(root: &Path, excludes: &[String]) -> (Vec<SymbolRow>, RefInde
                             .into_iter()
                             .map(|r| (r.name, r.kind, r.line as i64, r.context, r.target))
                             .collect();
-                    refs.insert(rel, (file_defs, file_uses));
+                    let mt = ent.metadata().ok().map(|m| file_mtime_secs(&m)).unwrap_or(0);
+                    refs.insert(rel.clone(), (file_defs, file_uses));
+                    filemeta.insert(rel, (mt, fnv_hex(&text)));
                     continue;
                 }
                 let lines: Vec<&str> = text.lines().collect();
@@ -1258,17 +1376,20 @@ fn extract_symbols(root: &Path, excludes: &[String]) -> (Vec<SymbolRow>, RefInde
                         (name.clone(), kind.clone(), *ln, std::cmp::min(ln + 40, lines.len() as i64), sig.clone())
                     })
                     .collect();
-                refs.insert(rel, (file_defs, Vec::new()));
+                let mt = ent.metadata().ok().map(|m| file_mtime_secs(&m)).unwrap_or(0);
+                refs.insert(rel.clone(), (file_defs, Vec::new()));
+                filemeta.insert(rel, (mt, fnv_hex(&text)));
             }
         }
     }
-    (out, RefIndex { refs })
+    (out, RefIndex { refs, meta: filemeta })
 }
 
 /// Phase 2/3 reference index drained from `extract_symbols`: per-file
 /// (defs, uses) collected during the same walk.
 struct RefIndex {
     refs: std::collections::HashMap<String, (RefDefsVec, RefUsesVec)>,
+    meta: std::collections::HashMap<String, (i64, String)>,
 }
 
 /// Test-only shim: symbol rows without the reference side-map.
@@ -1359,6 +1480,45 @@ fn do_index(path: String, embed: String, excludes: Vec<String>) -> Result<()> {
     }
     if ref_files > 0 {
         eprintln!("[index] code refs: {ref_files} files, {ref_uses_total} use rows");
+    }
+    // Freshness ledger (B-1): per-file mtime+hash+symbol count. Dir roots
+    // sweep dead rows alongside the symbols sweep above and record the
+    // walk root (rel-paths resolve against it at `status` time);
+    // single-file roots never saw the rest of the DB, so they only upsert.
+    if root.is_dir() {
+        let _ = store.set_meta(
+            "index_root",
+            &root.to_string_lossy().to_string(),
+        );
+    }
+    {
+        let mut counts: std::collections::HashMap<&str, i64> =
+            std::collections::HashMap::new();
+        for (rel, _, _, _, _, _, _) in &symbols {
+            *counts.entry(rel.as_str()).or_default() += 1;
+        }
+        for (rel, (mt, hash)) in &ref_index.meta {
+            let n = counts.get(rel.as_str()).copied().unwrap_or(0);
+            store.conn.execute(
+                "INSERT OR REPLACE INTO indexed_files(path,mtime,content_hash,sym_count) VALUES(?1,?2,?3,?4)",
+                rusqlite::params![rel, mt, hash, n],
+            )?;
+        }
+        if root.is_dir() {
+            let db_indexed: Vec<String> = store
+                .conn
+                .prepare("SELECT path FROM indexed_files")?
+                .query_map([], |r| r.get(0))?
+                .flatten()
+                .collect();
+            for dp in &db_indexed {
+                if !live.contains(dp) {
+                    store
+                        .conn
+                        .execute("DELETE FROM indexed_files WHERE path=?1", [dp])?;
+                }
+            }
+        }
     }
     if !symbols.is_empty() {
         let sigs: Vec<String> = symbols.iter().map(|(_, _, _, _, _, _, embed_text)| embed_text.clone()).collect();
@@ -1531,6 +1691,33 @@ fn do_status() -> Result<()> {
             println!("files: {n_files}  symbols: {n_syms}  ref-defs: {n_defs}  ref-uses: {n_uses}");
             println!("notes: {n_notes}  entities: {n_ents}  edges: {n_edges}");
             println!("embeddings: {prov} dim={dim}");
+            // Freshness (B-1): detect + report; refresh with `cortex index`.
+            let n_indexed = count("SELECT COUNT(*) FROM indexed_files");
+            if n_indexed == 0 && n_syms > 0 {
+                println!("freshness: unknown (re-index once to enable tracking)");
+            } else if n_indexed > 0 {
+                let idx_root = store
+                    .get_meta("index_root")?
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| base.clone());
+                let fr = check_freshness(&store, &idx_root);
+                if fr.dirty.is_empty() && fr.missing.is_empty() && fr.untracked == 0 {
+                    println!("freshness: clean ({} files tracked)", fr.indexed);
+                } else {
+                    println!(
+                        "freshness: {} dirty, {} missing, {} untracked — run `cortex index .`",
+                        fr.dirty.len(),
+                        fr.missing.len(),
+                        fr.untracked
+                    );
+                    for d in fr.dirty.iter().take(10) {
+                        println!("  stale: {d}");
+                    }
+                    for m in fr.missing.iter().take(10) {
+                        println!("  gone: {m}");
+                    }
+                }
+            }
             if n_syms == 0 {
                 println!("index is empty — run `cortex index <path>`");
             }
@@ -1659,6 +1846,53 @@ mod tests {
             store.conn.query_row("SELECT embedding FROM symbols LIMIT 1", [], |r| r.get(0)).unwrap()
         };
         assert_eq!(blob1, blob2, "reindex changed vectors: fidelity broken");
+        std::env::set_current_dir(cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn freshness_detects_edit_delete_and_new() {
+        let _g = LOCK.lock().unwrap();
+        let dir = temp_dir_with_nanos("cx_fresh");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        run(vec!["cortex".into(), "init".into(), "--embed".into(), "hash".into(), "--yes".into()]).unwrap();
+        let sub = dir.join("proj");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("a.py"), "def compute(x):\n    \"\"\"Scale it.\"\"\"\n    return x * 2\n").unwrap();
+        run(vec!["cortex".into(), "index".into(), sub.to_string_lossy().to_string(), "--embed".into(), "hash".into()]).unwrap();
+        let db = dir.join(".cortex/memory.db").to_string_lossy().to_string();
+        let fresh = || {
+            let store = Store::open_at(&db).unwrap();
+            check_freshness(&store, &sub)
+        };
+        {
+            let store = Store::open_at(&db).unwrap();
+            let idx_root = store.get_meta("index_root").unwrap();
+            assert_eq!(idx_root, Some(sub.to_string_lossy().to_string()), "walk root persisted");
+        }
+        let r0 = fresh();
+        assert_eq!(r0.indexed, 1, "one file tracked");
+        assert!(r0.dirty.is_empty() && r0.missing.is_empty() && r0.untracked == 0, "clean right after index");
+        // Ledger row carries mtime, hash, and symbol count.
+        {
+            let store = Store::open_at(&db).unwrap();
+            let (n, h): (i64, String) = store.conn.query_row(
+                "SELECT sym_count, content_hash FROM indexed_files LIMIT 1",
+                [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            assert!(n >= 1, "sym_count");
+            assert_eq!(h.len(), 16, "fnv hex hash");
+        }
+        std::fs::write(sub.join("a.py"), "def compute(x):\n    \"\"\"Scale it.\"\"\"\n    return x * 3\n").unwrap();
+        std::fs::write(sub.join("b.py"), "def g():\n    return 3\n").unwrap();
+        let r1 = fresh();
+        assert_eq!(r1.dirty, vec!["a.py".to_string()], "edited file dirty");
+        assert_eq!(r1.untracked, 1, "new file untracked");
+        std::fs::remove_file(sub.join("a.py")).unwrap();
+        let r2 = fresh();
+        assert_eq!(r2.missing, vec!["a.py".to_string()], "deleted file missing");
         std::env::set_current_dir(cwd).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
