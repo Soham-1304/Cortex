@@ -712,6 +712,7 @@ mod tests {
             rho_naive: 0.0,
             took_ms: 0,
             stages: crate::compile::StageTimesSer { fts_ms: 0, vec_ms: 0, graph_ms: 0, pack_ms: 0 },
+            stale: Vec::new(),
         };
         assert!(cortex_hit(&payload, "d7"));
         let sym_only = Payload {
@@ -728,6 +729,7 @@ mod tests {
             rho_naive: 0.0,
             took_ms: 0,
             stages: crate::compile::StageTimesSer { fts_ms: 0, vec_ms: 0, graph_ms: 0, pack_ms: 0 },
+            stale: Vec::new(),
         };
         assert!(cortex_hit(&sym_only, "d7"));
         let miss = Payload {
@@ -742,6 +744,7 @@ mod tests {
             rho_naive: 0.0,
             took_ms: 0,
             stages: crate::compile::StageTimesSer { fts_ms: 0, vec_ms: 0, graph_ms: 0, pack_ms: 0 },
+            stale: Vec::new(),
         };
         assert!(!cortex_hit(&miss, "d7"));
     }

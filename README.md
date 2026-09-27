@@ -201,6 +201,24 @@ cortex embeddings use openai --api-key-env OPENAI_API_KEY
 cortex reindex
 ```
 
+### Keeping the index fresh
+
+`cortex status` reports index freshness (clean vs dirty/missing/untracked
+files, tracked since first index). `recall` (CLI and MCP) carries a
+stale-index notice when files changed under it — refresh with:
+
+```bash
+cortex index .
+```
+
+Optional git hook (`.git/hooks/post-merge`, and `post-checkout` for branch
+switches) to re-index after pulls:
+
+```bash
+#!/bin/sh
+cortex index .
+```
+
 ### Agentic Evaluation
 
 Retrieval is measured by the `bench` crate on real-issue benchmarks

@@ -585,7 +585,10 @@ fn do_recall(task: String, budget: i64, json: bool) -> Result<()> {
     } else {
         store.set_meta("embedding_dim", &provider.dim().to_string())?;
     }
-    let payload = crate::compile::compile(&store, &core, provider.as_ref(), &task, budget)?;
+    let mut payload = crate::compile::compile(&store, &core, provider.as_ref(), &task, budget)?;
+    // Stale-index notice (B-2): mtime prescreen, best-effort, capped.
+    // Full verdict lives in `cortex status`; recall never fails over this.
+    payload.stale = stale_quick(&store, &index_root_for(&store, &base));
     // Structured event log (plan item 4) + recall feedback loop (plan item 1).
     // Both are best-effort: never fail the recall over telemetry/bookkeeping.
     {
@@ -617,6 +620,13 @@ fn do_recall(task: String, budget: i64, json: bool) -> Result<()> {
             let _ = store.reinforce_recalled(&note_ids);
             let _ = crate::store::checkpoint(&store);
         }
+    }
+    if !payload.stale.is_empty() {
+        eprintln!(
+            "warning: index stale ({} files: {}) — run `cortex index .` (`cortex status` for full verdict)",
+            payload.stale.len(),
+            payload.stale.join(",")
+        );
     }
     if json {
         let s = serde_json::to_string_pretty(&payload)?;
@@ -1183,6 +1193,45 @@ struct FreshReport {
     untracked: usize,
 }
 
+/// Repo root the last dir-index walked (rel-paths resolve against it).
+pub(crate) fn index_root_for(store: &Store, base: &Path) -> std::path::PathBuf {
+    match store.get_meta("index_root") {
+        Ok(Some(r)) => std::path::PathBuf::from(r),
+        _ => base.to_path_buf(),
+    }
+}
+
+/// Recall-time freshness prescreen (B-2): mtime + existence only, no content
+/// reads — O(files) stats instead of O(bytes). Catches edits/deletes;
+/// same-second rewrites slip through to the exact `status` check. Capped.
+/// Never fails: a missing table (legacy) means unknown, not stale.
+pub(crate) fn stale_quick(store: &Store, root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut st = match store.conn.prepare("SELECT path, mtime FROM indexed_files") {
+        Ok(st) => st,
+        Err(_) => return out,
+    };
+    let rows: Vec<(String, i64)> = st
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .map(|m| m.flatten().collect())
+        .unwrap_or_default();
+    for (rel, mt) in rows {
+        match std::fs::metadata(root.join(&rel)) {
+            Err(_) => out.push(rel),
+            Ok(m) => {
+                if file_mtime_secs(&m) != mt {
+                    out.push(rel);
+                }
+            }
+        }
+        if out.len() >= 10 {
+            break;
+        }
+    }
+    out.sort();
+    out
+}
+
 fn check_freshness(store: &Store, root: &Path) -> FreshReport {
     let mut rows: Vec<(String, i64, String)> = Vec::new();
     if let Ok(mut st) = store
@@ -1696,10 +1745,7 @@ fn do_status() -> Result<()> {
             if n_indexed == 0 && n_syms > 0 {
                 println!("freshness: unknown (re-index once to enable tracking)");
             } else if n_indexed > 0 {
-                let idx_root = store
-                    .get_meta("index_root")?
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(|| base.clone());
+                let idx_root = index_root_for(&store, &base);
                 let fr = check_freshness(&store, &idx_root);
                 if fr.dirty.is_empty() && fr.missing.is_empty() && fr.untracked == 0 {
                     println!("freshness: clean ({} files tracked)", fr.indexed);
@@ -1848,6 +1894,40 @@ mod tests {
         assert_eq!(blob1, blob2, "reindex changed vectors: fidelity broken");
         std::env::set_current_dir(cwd).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stale_quick_flags_drift_and_missing() {
+        // mtime-only prescreen: deterministic via hand-set row mtimes
+        // (no sleeps, no content reads).
+        let dir = temp_dir_with_nanos("cx_quick");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("f.py"), "def f():\n    return 1\n").unwrap();
+        let st = Store::open_in_memory().unwrap();
+        let mt = file_mtime_secs(&std::fs::metadata(dir.join("f.py")).unwrap());
+        st.conn.execute(
+            "INSERT INTO indexed_files(path,mtime,content_hash,sym_count) VALUES('f.py',?1,'abc',1)",
+            [mt]).unwrap();
+        st.conn.execute(
+            "INSERT INTO indexed_files(path,mtime,content_hash,sym_count) VALUES('gone.py',0,'x',0)",
+            []).unwrap();
+        // Clean: mtime matches, missing row reported.
+        assert_eq!(stale_quick(&st, &dir), vec!["gone.py".to_string()]);
+        // Drifted mtime → stale (content never read).
+        st.conn.execute("UPDATE indexed_files SET mtime=0 WHERE path='f.py'", []).unwrap();
+        assert_eq!(
+            stale_quick(&st, &dir),
+            vec!["f.py".to_string(), "gone.py".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn index_root_defaults_to_base() {
+        let st = Store::open_in_memory().unwrap();
+        let base = std::path::PathBuf::from("/tmp/cx_base_probe");
+        assert_eq!(index_root_for(&st, &base), base);
     }
 
     #[test]

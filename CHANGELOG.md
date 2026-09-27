@@ -72,3 +72,8 @@
   nDCG -0.023. Mechanism matches the GAK-pack failure: aggregated file
   vocabulary lifts big wrong-file neighborhoods uniformly, burying the
   precise symbol legs. Pooling had nothing left to add (raw==pool).
+- B-2 staleness triggers: recall-time mtime prescreen (`stale_quick`, capped,
+  never fatal) attached to CLI + MCP payloads as `stale` with a stderr
+  warning pointing at `cortex index .`; README documents the fresh-keeping
+  flow incl. git-hook snippet. Fulfills the pre-existing MCP staleness
+  contract in the tool description.

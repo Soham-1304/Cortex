@@ -41,6 +41,9 @@ pub struct Payload {
     /// Per-stage timings (plan item 5). Flows into `recall --json` and the
     /// event log so latency attribution needs no separate profiling run.
     pub stages: StageTimesSer,
+    /// Stale-index notice (B-2): dirty+missing files at recall time, filled
+    /// by CLI/MCP callers (compile() itself has no repo root). Capped.
+    pub stale: Vec<String>,
 }
 
 fn truncate_by_tokens(s: &str, budget: i64) -> String {
@@ -364,6 +367,7 @@ pub fn compile(
                 rho_naive: 0.0,
                 took_ms: t0.elapsed().as_millis() as u64,
                 stages: StageTimesSer { fts_ms: 0, vec_ms: 0, graph_ms: 0, pack_ms: 0 },
+                stale: Vec::new(),
             });
         }
         let trunc = truncate_by_tokens(&trimmed, budget);
@@ -380,6 +384,7 @@ pub fn compile(
             rho_naive: 0.0,
             took_ms: t0.elapsed().as_millis() as u64,
             stages: StageTimesSer { fts_ms: 0, vec_ms: 0, graph_ms: 0, pack_ms: 0 },
+            stale: Vec::new(),
         });
     }
     let core_opt = if has_core {
@@ -998,6 +1003,7 @@ pub fn compile(
         rho_naive,
         took_ms: t0.elapsed().as_millis() as u64,
         stages,
+        stale: Vec::new(),
     })
 }
 

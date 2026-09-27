@@ -162,7 +162,7 @@ fn dispatch(name: &str, args: &Value, id: Value) -> Value {
                         return Err(format!("embedding dim mismatch (db={}, config={}): run cortex reindex", db_dim, provider.dim()));
                     }
                 }
-                let payload = crate::compile::compile(&store, &core, provider.as_ref(), &task, budget).map_err(|e| e.to_string())?;
+                let mut payload = crate::compile::compile(&store, &core, provider.as_ref(), &task, budget).map_err(|e| e.to_string())?;
                 // Event log + recall feedback (items 1 & 4), best-effort.
                 let hits: Vec<crate::events::EventHit> = payload
                     .memories
@@ -173,6 +173,9 @@ fn dispatch(name: &str, args: &Value, id: Value) -> Value {
                         score: m.score,
                     })
                     .collect();
+                // Stale-index notice (B-2): fulfills the tool description's
+                // staleness contract; best-effort, capped.
+                payload.stale = crate::cli::stale_quick(&store, &crate::cli::index_root_for(&store, &base));
                 crate::events::log_event(
                     &base, "mcp_compile", &task, &hits,
                     payload.tokens_used, payload.took_ms,
