@@ -88,3 +88,7 @@
   vs 0.822 baseline with identical nDCG — suspected live query-embedding
   nondeterminism; fine-grained bench deltas need a repeatability probe
   before any weight conclusion.
+- Ship bar re-anchored (Option A, owner call): file recall >0.90 all repos +
+  agent task-success on real issues. Span >0.70 retired as a gate (0-for-2
+  spikes + saturating weights say lexical+vector+graph won't 2x it); span
+  stays a diagnostic. Remaining retrieval job: django -0.08, sympy -0.15.
