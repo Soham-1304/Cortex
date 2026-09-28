@@ -22,6 +22,39 @@ pub struct SymbolHit {
     pub signature: Option<String>,
 }
 
+/// One file's candidate symbols, in rank order. Orientation-shaped output:
+/// the agent opens the file, reads around — groups match that workflow.
+/// Flat `symbols` stays for compatibility; groups reference the same hits
+/// (token accounting counts them once, in the pack loop above).
+#[derive(Debug, Clone, Serialize)]
+pub struct FileGroup {
+    pub path: String,
+    pub symbols: Vec<SymbolHit>,
+}
+
+/// Group flat symbol hits by file, preserving first-seen file order and
+/// within-file rank order. Every input appears exactly once.
+fn group_symbols(syms: Vec<SymbolHit>) -> Vec<FileGroup> {
+    let mut order: Vec<String> = Vec::new();
+    let mut map: std::collections::HashMap<String, Vec<SymbolHit>> =
+        std::collections::HashMap::new();
+    for sym in syms {
+        map.entry(sym.path.clone())
+            .or_insert_with(|| {
+                order.push(sym.path.clone());
+                Vec::new()
+            })
+            .push(sym);
+    }
+    order
+        .into_iter()
+        .map(|path| {
+            let symbols = map.remove(&path).unwrap_or_default();
+            FileGroup { path, symbols }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StageTimesSer {
     pub fts_ms: u64,
@@ -44,6 +77,9 @@ pub struct Payload {
     /// Stale-index notice (B-2): dirty+missing files at recall time, filled
     /// by CLI/MCP callers (compile() itself has no repo root). Capped.
     pub stale: Vec<String>,
+    /// Orientation-shaped view of `symbols` (phase 2): per-file groups.
+    /// Additive — flat consumers keep working untouched.
+    pub groups: Vec<FileGroup>,
 }
 
 fn truncate_by_tokens(s: &str, budget: i64) -> String {
@@ -368,6 +404,7 @@ pub fn compile(
                 took_ms: t0.elapsed().as_millis() as u64,
                 stages: StageTimesSer { fts_ms: 0, vec_ms: 0, graph_ms: 0, pack_ms: 0 },
                 stale: Vec::new(),
+                groups: Vec::new(),
             });
         }
         let trunc = truncate_by_tokens(&trimmed, budget);
@@ -385,6 +422,7 @@ pub fn compile(
             took_ms: t0.elapsed().as_millis() as u64,
             stages: StageTimesSer { fts_ms: 0, vec_ms: 0, graph_ms: 0, pack_ms: 0 },
             stale: Vec::new(),
+            groups: Vec::new(),
         });
     }
     let core_opt = if has_core {
@@ -995,6 +1033,7 @@ pub fn compile(
         0.0
     };
     let tokens_used = core_cost + packed_cost;
+    let groups = group_symbols(out_syms.clone());
     Ok(Payload {
         core: core_opt,
         memories: out_mems,
@@ -1004,6 +1043,7 @@ pub fn compile(
         took_ms: t0.elapsed().as_millis() as u64,
         stages,
         stale: Vec::new(),
+        groups,
     })
 }
 
@@ -1355,6 +1395,32 @@ mod tests {
         assert!(out.iter().all(|(_, s)| *s > 0.0));
         let scores: Vec<f64> = out.iter().map(|(_, s)| *s).collect();
         assert_eq!(scores, vec![0.9, 0.7, 0.8, 0.2, 0.1]);
+    }
+
+    #[test]
+    fn group_symbols_preserves_orders_exactly_once() {
+        let sym = |path: &str, name: &str| SymbolHit {
+            name: name.to_string(),
+            path: path.to_string(),
+            line_start: 1,
+            line_end: 10,
+            signature: None,
+        };
+        let groups = group_symbols(vec![
+            sym("b.py", "b0"),
+            sym("a.py", "a0"),
+            sym("b.py", "b1"),
+        ]);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].path, "b.py");
+        assert_eq!(
+            groups[0].symbols.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["b0", "b1"]
+        );
+        assert_eq!(groups[1].path, "a.py");
+        assert!(group_symbols(vec![]).is_empty());
+        let total: usize = groups.iter().map(|g| g.symbols.len()).sum();
+        assert_eq!(total, 3);
     }
 
     #[test]

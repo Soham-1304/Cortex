@@ -667,8 +667,13 @@ fn do_recall(task: String, budget: i64, json: bool) -> Result<()> {
         for m in &payload.memories {
             println!("[{}] {} (score {:.3})", m.id, m.content, m.score);
         }
-        for s in &payload.symbols {
-            println!("{} {}:{} {}", s.path, s.line_start, s.line_end, s.name);
+        // Orientation-shaped rendering: files carrying their candidates.
+        // Flat `symbols` remains the machine-readable source in --json.
+        for g in &payload.groups {
+            println!("== {} ==", g.path);
+            for s in &g.symbols {
+                println!("  {}:{} {}", s.line_start, s.line_end, s.name);
+            }
         }
         println!("tokens_used={} rho={:.3}", payload.tokens_used, payload.rho_naive);
     }

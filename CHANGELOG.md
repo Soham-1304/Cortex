@@ -119,3 +119,6 @@
 - Hooks cover post-commit too (committed edits re-index); uncommitted edits
   stay manual by design (no daemon watcher — hooks plus notices are the
   whole freshness story).
+- Grouped payload (owner override of the 0.90 gate): additive `groups`
+  (files carrying candidates) on CLI text + MCP JSON; flat symbols kept,
+  tokens counted once. Shape, not ranking.
