@@ -107,3 +107,7 @@
   +0.008 (noise), span down everywhere (10,2/10,4: -0.076). Round-robin
   swaps flat ranks ~11-20 (often gold same-file neighbors) for weak files'
   bests; quotas over wrong file order just re-exclude. Pool stays.
+- Non-Python use-refs (plan point 3): generic import/call extraction for
+  rs/go/js/ts/java into code_refs_use (Go blocks, require/from-forms,
+  dotted full+short, def/comment/keyword filtering, decl lookbehind).
+  find/map and the refs leg now see callers repo-wide. 115/54 green.

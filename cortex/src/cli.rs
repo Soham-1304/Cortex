@@ -1160,6 +1160,248 @@ type RefUsesVec = Vec<(String, String, i64, String, Option<String>)>;
 /// negations ignored, `dir/` prefixes match subtrees, `*.ext` globs match
 /// file names. Good enough to keep third-party noise out of the graph;
 /// full gitignore semantics (nested files, `**`) are future work.
+/// Call-name stoplist for the generic use scanner: control flow, definitions,
+/// imports, and literals never denote call sites. The declaration lookbehind
+/// (`prev_word` + `CALL_KEEP`) eats the rest: `void m(` skips `m` while
+/// `new Bar(` keeps `Bar`.
+const USE_STOP: &[&str] = &[
+    "if", "for", "while", "with", "return", "assert", "yield", "throw", "await",
+    "require", "function", "func", "fn", "def", "class", "struct", "enum",
+    "trait", "interface", "import", "from", "use", "len", "print", "isinstance",
+    "raise", "switch", "match", "loop", "else", "elif", "catch", "new", "self",
+    "Self", "this", "true", "false", "null", "nil",
+];
+
+/// Words where `word name(` is still a call (`return foo(`, `new Bar(`).
+/// Anything else preceding a bare identifier (`void m(`, `static parse(`)
+/// reads as a declaration — the candidate is skipped.
+const CALL_KEEP: &[&str] = &[
+    "new", "return", "if", "for", "while", "with", "switch", "catch", "using",
+    "await", "yield", "throw", "else", "elif", "assert", "match",
+];
+
+/// Identifier word immediately before byte offset `name_start` on `line`
+/// (ASCII walk — callers only pass identifier-boundary offsets).
+fn prev_word(line: &str, name_start: usize) -> Option<&str> {
+    let b = line[..name_start].trim_end();
+    if b.is_empty() {
+        return None;
+    }
+    let bytes = b.as_bytes();
+    let mut s = bytes.len();
+    while s > 0 && (bytes[s - 1].is_ascii_alphanumeric() || bytes[s - 1] == b'_') {
+        s -= 1;
+    }
+    let w = &b[s..];
+    if w.is_empty() {
+        None
+    } else {
+        Some(w)
+    }
+}
+
+/// First `'...'` or `"..."` span on the line (import module paths).
+fn quoted_mod(t: &str) -> Option<String> {
+    let b = t.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        if c == b'\'' || c == b'"' {
+            let mut j = i + 1;
+            while j < b.len() && b[j] != c {
+                j += 1;
+            }
+            if j < b.len() {
+                let m = &t[i + 1..j];
+                if !m.is_empty() {
+                    return Some(m.to_string());
+                }
+            }
+            break;
+        }
+    }
+    None
+}
+
+/// Import row for one trimmed non-comment, non-def line.
+/// Returns (name, kind, target) mirroring the Python indexer's vocabulary
+/// (`import` / `import_from`, top-segment rows added by the caller).
+fn parse_import_generic(t: &str, lang: &str) -> Option<(String, String, Option<String>)> {
+    match lang {
+        "rs" => {
+            let rest = t.strip_prefix("use ")?;
+            let path = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_end_matches(|c| c == ';' || c == '{' || c == ',');
+            if path.is_empty() {
+                return None;
+            }
+            Some((path.to_string(), "import".into(), None))
+        }
+        "go" => {
+            if !t.starts_with("import") {
+                return None;
+            }
+            quoted_mod(t).map(|m| (m, "import".into(), None))
+        }
+        "js" | "ts" | "tsx" => {
+            if t.contains("require(") {
+                return quoted_mod(t).map(|m| (m, "import".into(), None));
+            }
+            if !t.starts_with("import ") {
+                return None;
+            }
+            let kind = if t.contains(" from ") { "import_from" } else { "import" };
+            quoted_mod(t).map(|m| (m, kind.into(), None))
+        }
+        "java" => {
+            let rest = t.strip_prefix("import ")?;
+            if rest.starts_with("static ") {
+                return None;
+            }
+            let name = rest.split(';').next().unwrap_or("").trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some((name.to_string(), "import".into(), None))
+        }
+        _ => None,
+    }
+}
+
+/// Generic use-ref extraction for non-Python files (point 3): imports +
+/// call sites with single-line context, into `code_refs_use` rows.
+/// Dotted calls emit full + short names (mirrors the Python indexer);
+/// def lines, comment lines, and unparsed import shapes never emit calls.
+fn extract_uses_generic(text: &str, lang: &str) -> RefUsesVec {
+    let mut out = Vec::new();
+    let mut go_import_block = false;
+    for (i, line) in text.lines().enumerate() {
+        let ln = (i + 1) as i64;
+        let t = line.trim();
+        if t.is_empty() {
+            continue;
+        }
+        // Go multi-line import blocks: every quoted line is a module.
+        if lang == "go" {
+            if t.starts_with("import (") || t == "import(" {
+                go_import_block = true;
+                continue;
+            }
+            if go_import_block {
+                if t.starts_with(')') {
+                    go_import_block = false;
+                    continue;
+                }
+                if let Some(m) = quoted_mod(t) {
+                    let mut ctx = t.to_string();
+                    if ctx.len() > 200 {
+                        ctx.truncate(200);
+                    }
+                    out.push((m.clone(), "import".into(), ln, ctx.clone(), None));
+                    if let Some(top) = top_segment(&m) {
+                        out.push((top, "import".into(), ln, ctx, Some(m)));
+                    }
+                }
+                continue;
+            }
+        }
+        if t.starts_with("//") || t.starts_with('#') || t.starts_with("/*") || t.starts_with('*') || t.starts_with("<!--") {
+            continue;
+        }
+        // Definition lines: names live in code_refs_def, not here.
+        if extract_name_from_line(line).is_some() {
+            continue;
+        }
+        let mut ctx = t.to_string();
+        if ctx.len() > 200 {
+            ctx.truncate(200);
+        }
+        if let Some((name, kind, target)) = parse_import_generic(t, lang) {
+            out.push((name.clone(), kind.clone(), ln, ctx.clone(), target.clone()));
+            if kind == "import" {
+                if let Some(top) = top_segment(&name) {
+                    out.push((top, "import".into(), ln, ctx, Some(name)));
+                }
+            }
+            continue;
+        }
+        if t.starts_with("import ") || t.starts_with("from ") || t.starts_with("use ") {
+            continue;
+        }
+        // Call scan: dotted-or-plain identifier directly followed by `(`.
+        let bytes = t.as_bytes();
+        let mut j = 0;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if c.is_ascii_alphabetic() || c == b'_' {
+                let s = j;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'.')
+                {
+                    j += 1;
+                }
+                let mut e = j;
+                while e > s && bytes[e - 1] == b'.' {
+                    e -= 1;
+                }
+                if e == s {
+                    continue;
+                }
+                let mut k = j;
+                while k < bytes.len() && bytes[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k < bytes.len() && bytes[k] == b'(' {
+                    let name = &t[s..e];
+                    let short = name.rsplit('.').next().unwrap_or(name);
+                    if USE_STOP.contains(&name) || USE_STOP.contains(&short) {
+                        continue;
+                    }
+                    if !name.contains('.') {
+                        if let Some(prev) = prev_word(t, s) {
+                            if !CALL_KEEP.contains(&prev) {
+                                continue;
+                            }
+                        }
+                    }
+                    out.push((name.to_string(), "call".into(), ln, ctx.clone(), None));
+                    if name.contains('.') && !USE_STOP.contains(&short) {
+                        out.push((short.to_string(), "call".into(), ln, ctx.clone(), None));
+                    }
+                }
+            } else {
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Top file-segment of a dotted/slashed/scoped module path (`a::b::c` →
+/// `a`, `@scope/pkg` → `@scope/pkg`). None when there is nothing to split.
+fn top_segment(name: &str) -> Option<String> {
+    let top = if name.starts_with('@') {
+        let mut parts = name.split('/');
+        let first = parts.next().unwrap_or("");
+        let second = parts.next().unwrap_or("");
+        if second.is_empty() {
+            return None;
+        }
+        format!("{first}/{second}")
+    } else {
+        name.split(|c| c == '.' || c == ':' || c == '/')
+            .next()
+            .unwrap_or("")
+            .to_string()
+    };
+    if top.is_empty() || top == name {
+        None
+    } else {
+        Some(top)
+    }
+}
+
 fn load_gitignore(root: &Path) -> Vec<String> {
     let raw = match std::fs::read_to_string(root.join(".gitignore")) {
         Ok(r) => r,
@@ -1443,10 +1685,6 @@ fn extract_symbols(root: &Path, excludes: &[String]) -> (Vec<SymbolRow>, RefInde
                     let rel = p.strip_prefix(root).unwrap_or(&p).to_string_lossy().to_string().replace('\\', "/");
                     out.push((rel, name.clone(), kind.clone(), *ln, end, sig.clone(), sig.clone()));
                 }
-                // Non-Python files get defs (no use-refs yet — tree-sitter
-                // ref extraction is Python-only). Defs power
-                // file_connections() incoming edges on every language, so
-                // the graph leg works repo-wide instead of Python-only.
                 let file_defs: RefDefsVec = marks
                     .iter()
                     .filter(|(_, _, _, sig)| sig.len() >= 5)
@@ -1455,7 +1693,12 @@ fn extract_symbols(root: &Path, excludes: &[String]) -> (Vec<SymbolRow>, RefInde
                     })
                     .collect();
                 let mt = ent.metadata().ok().map(|m| file_mtime_secs(&m)).unwrap_or(0);
-                refs.insert(rel.clone(), (file_defs, Vec::new()));
+                // Non-Python files get defs PLUS generic use-refs (point 3):
+                // imports + call sites feed file_connections() incoming edges
+                // and the refs leg repo-wide — no longer Python-only.
+                let lang = ext_lc.trim_start_matches('.');
+                let file_uses: RefUsesVec = extract_uses_generic(&text, lang);
+                refs.insert(rel.clone(), (file_defs, file_uses));
                 filemeta.insert(rel, (mt, fnv_hex(&text)));
             }
         }
@@ -1803,6 +2046,74 @@ fn do_status() -> Result<()> {
 mod tests {
     use super::*;
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn generic_uses_cover_five_langs() {
+        let has = |rows: &RefUsesVec, name: &str, kind: &str| {
+            rows.iter().any(|(n, k, _, _, _)| n == name && k == kind)
+        };
+        // Rust: use-import + calls; `fn main` def must not leak a call.
+        let rs = extract_uses_generic(
+            "use tokio::spawn;\nfn main() {\n    spawn(work());\n}\n",
+            "rs",
+        );
+        assert!(has(&rs, "tokio::spawn", "import"), "{rs:?}");
+        assert!(has(&rs, "tokio", "import"), "{rs:?}");
+        assert!(has(&rs, "spawn", "call"), "{rs:?}");
+        assert!(has(&rs, "work", "call"), "{rs:?}");
+        assert!(!has(&rs, "main", "call"), "def leaked: {rs:?}");
+        // Go: quoted imports (incl. block) + dotted calls with short names.
+        let go = extract_uses_generic(
+            "package m\nimport (\n\t\"fmt\"\n\talias \"os/exec\"\n)\nfunc main() {\n\tfmt.Println(run(exec.Command()))\n}\n",
+            "go",
+        );
+        assert!(has(&go, "fmt", "import"), "{go:?}");
+        assert!(has(&go, "os/exec", "import"), "{go:?}");
+        assert!(has(&go, "os", "import"), "{go:?}");
+        assert!(has(&go, "fmt.Println", "call"), "{go:?}");
+        assert!(has(&go, "Println", "call"), "{go:?}");
+        assert!(has(&go, "run", "call"), "{go:?}");
+        assert!(!has(&go, "main", "call"), "def leaked: {go:?}");
+        // JS: from-import, require, calls; `function App` skipped.
+        let js = extract_uses_generic(
+            "import React from 'react';\nconst el = require('dom');\nfunction App() {\n    render(el);\n}\n",
+            "js",
+        );
+        assert!(has(&js, "react", "import_from"), "{js:?}");
+        assert!(has(&js, "dom", "import"), "{js:?}");
+        assert!(has(&js, "render", "call"), "{js:?}");
+        assert!(!has(&js, "App", "call"), "def leaked: {js:?}");
+        assert!(!has(&js, "require", "call"), "require leaked: {js:?}");
+        // Java: import + top segment; `void m()` skipped, `new Bar()` kept.
+        let java = extract_uses_generic(
+            "import com.foo.Bar;\nclass A {\n    void m() {\n        Bar b = new Bar();\n        helper(b);\n    }\n}\n",
+            "java",
+        );
+        assert!(has(&java, "com.foo.Bar", "import"), "{java:?}");
+        assert!(has(&java, "com", "import"), "{java:?}");
+        assert!(has(&java, "Bar", "call"), "{java:?}");
+        assert!(has(&java, "helper", "call"), "{java:?}");
+        assert!(!has(&java, "m", "call"), "method def leaked: {java:?}");
+        assert!(!has(&java, "A", "call"), "class leaked: {java:?}");
+    }
+
+    #[test]
+    fn nonpython_index_carries_use_refs() {
+        let dir = temp_dir_with_nanos("cx_idx_uses");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("main.rs"),
+            "use tokio::spawn;\nfn main() {\n    spawn(work());\n}\n",
+        )
+        .unwrap();
+        let (rows, ridx) = extract_symbols(&dir, &[]);
+        assert!(rows.iter().any(|(_, n, _, _, _, _, _)| n == "main"), "{rows:?}");
+        let uses = &ridx.refs["main.rs"].1;
+        assert!(uses.iter().any(|(n, k, _, _, _)| n == "spawn" && k == "call"), "{uses:?}");
+        assert!(uses.iter().any(|(n, k, _, _, _)| n == "tokio::spawn" && k == "import"), "{uses:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn gitignore_patterns_match() {
