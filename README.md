@@ -211,12 +211,13 @@ stale-index notice when files changed under it — refresh with:
 cortex index .
 ```
 
-Optional git hook (`.git/hooks/post-merge`, and `post-checkout` for branch
-switches) to re-index after pulls:
+Hands-free freshness (opt-in, zero daemon): install git hooks that
+re-index after pulls and branch switches (foreign hooks are never
+overwritten without `--force`):
 
 ```bash
-#!/bin/sh
-cortex index .
+cortex hook install
+# cortex hook uninstall  # removes only ours
 ```
 
 ### Agentic Evaluation

@@ -106,6 +106,13 @@ enum Cmd {
         #[arg(long)]
         stdio: bool,
     },
+    /// Git-hook freshness automation: `hook install` writes post-merge +
+    /// post-checkout hooks that re-index after pulls and branch switches.
+    /// Opt-in only — Cortex stays zero-daemon by default.
+    Hook {
+        #[command(subcommand)]
+        sub: HookCmd,
+    },
     /// Index health: db size, row counts, embedding config. The
     /// connect-time freshness check — run it before trusting recall.
     Status,
@@ -132,6 +139,15 @@ enum Cmd {
         #[arg(long)]
         out: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum HookCmd {
+    Install {
+        #[arg(long)]
+        force: bool,
+    },
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -178,6 +194,10 @@ pub fn run(argv: Vec<String>) -> Result<()> {
             CoreCmd::Edit { section, content } => do_core_edit(section, content),
         },
         Cmd::Serve { stdio } => do_serve(stdio),
+        Cmd::Hook { sub } => match sub {
+            HookCmd::Install { force } => do_hook_install(force),
+            HookCmd::Uninstall => do_hook_uninstall(),
+        },
         Cmd::Status => do_status(),
         Cmd::EvalLlm { tasks, seed, model, budget, per_turn, distractors, json, out } => {
             let api_key = std::env::var("OPENROUTER_API_KEY").unwrap_or_default();
@@ -1975,6 +1995,89 @@ fn do_core_edit(section: Option<String>, content: Option<String>) -> Result<()> 
     Ok(())
 }
 
+/// Managed-hook marker: only hooks carrying this line are overwritten or
+/// removed. Foreign hooks are never touched without `--force`.
+const HOOK_MARKER: &str = "# cortex-freshness-hook (managed by `cortex hook install`)";
+
+fn hook_body() -> String {
+    // Absolute binary path: hooks run with the user's PATH, which may not
+    // include cargo's bin dir. Fall back to `cortex` and let it fail loud
+    // into the log if even that is missing.
+    let bin = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "cortex".to_string());
+    format!(
+        "#!/bin/sh\n{HOOK_MARKER}\n# Re-index after pulls and branch switches.\n\
+         if [ -d \".cortex\" ]; then\n  \"{bin}\" index . >>.cortex/hook.log 2>&1 \\\n\
+         || echo \"$(date -u +%FT%TZ) index failed ($?)\" >>.cortex/hook.log\nfi\n"
+    )
+}
+
+/// `.git/hooks` dir for this checkout. Plain repos: `.git/hooks`.
+/// Linked worktrees carry a `.git` *file* (`gitdir: <path>`) — hooks live
+/// under that path instead.
+fn hooks_dir(base: &Path) -> Result<PathBuf> {
+    let dotgit = base.join(".git");
+    let meta = std::fs::metadata(&dotgit)
+        .map_err(|_| crate::Error::Cli("not a git checkout (no .git) — init git first".into()))?;
+    if meta.is_dir() {
+        return Ok(dotgit.join("hooks"));
+    }
+    let raw = std::fs::read_to_string(&dotgit)?;
+    let linked = raw
+        .strip_prefix("gitdir: ")
+        .map(str::trim)
+        .ok_or_else(|| crate::Error::Cli("unrecognized .git file layout".into()))?;
+    Ok(PathBuf::from(linked).join("hooks"))
+}
+
+const HOOK_NAMES: &[&str] = &["post-merge", "post-checkout"];
+
+fn do_hook_install(force: bool) -> Result<()> {
+    let base = current_base();
+    let dir = hooks_dir(&base)?;
+    std::fs::create_dir_all(&dir)?;
+    let body = hook_body();
+    for name in HOOK_NAMES {
+        let path = dir.join(name);
+        if path.exists() {
+            let cur = std::fs::read_to_string(&path).unwrap_or_default();
+            if !cur.contains(HOOK_MARKER) && !force {
+                println!("{name}: foreign hook left alone (use --force to replace)");
+                continue;
+            }
+        }
+        std::fs::write(&path, &body)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        println!("installed {name}");
+    }
+    println!("hooks will run `cortex index .` after pulls and branch switches (only where .cortex exists)");
+    Ok(())
+}
+
+fn do_hook_uninstall() -> Result<()> {
+    let base = current_base();
+    let dir = hooks_dir(&base)?;
+    for name in HOOK_NAMES {
+        let path = dir.join(name);
+        if !path.exists() {
+            continue;
+        }
+        let cur = std::fs::read_to_string(&path).unwrap_or_default();
+        if cur.contains(HOOK_MARKER) {
+            std::fs::remove_file(&path)?;
+            println!("removed {name}");
+        } else {
+            println!("{name}: foreign hook left alone");
+        }
+    }
+    Ok(())
+}
+
 fn do_serve(stdio: bool) -> Result<()> {
     if stdio {
         return crate::mcp::run_stdio();
@@ -2113,6 +2216,54 @@ mod tests {
         assert!(uses.iter().any(|(n, k, _, _, _)| n == "spawn" && k == "call"), "{uses:?}");
         assert!(uses.iter().any(|(n, k, _, _, _)| n == "tokio::spawn" && k == "import"), "{uses:?}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hook_install_respects_foreign_hooks() {
+        let _g = LOCK.lock().unwrap();
+        let dir = temp_dir_with_nanos("cx_hook");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/hooks")).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        // Foreign hook survives a plain install, falls to --force.
+        std::fs::write(dir.join(".git/hooks/post-merge"), "#!/bin/sh\necho hi\n").unwrap();
+        run(vec!["cortex".into(), "hook".into(), "install".into()]).unwrap();
+        let kept = std::fs::read_to_string(dir.join(".git/hooks/post-merge")).unwrap();
+        assert!(!kept.contains("cortex-freshness-hook"), "foreign hook overwritten!");
+        assert!(kept.contains("echo hi"));
+        run(vec!["cortex".into(), "hook".into(), "install".into(), "--force".into()]).unwrap();
+        let ours = std::fs::read_to_string(dir.join(".git/hooks/post-merge")).unwrap();
+        assert!(ours.contains("cortex-freshness-hook"), "missing marker");
+        assert!(ours.contains(".cortex"), "must guard on .cortex presence");
+        assert!(ours.contains("hook.log"), "failures must land in hook.log");
+        // post-checkout installed fresh; both executable.
+        let co = dir.join(".git/hooks/post-checkout");
+        assert!(co.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&co).unwrap().permissions().mode() & 0o111,
+                0o111,
+                "hook must be executable"
+            );
+        }
+        // Uninstall removes ours, keeps foreigners.
+        std::fs::write(dir.join(".git/hooks/post-checkout"), "#!/bin/sh\necho yo\n").unwrap();
+        run(vec!["cortex".into(), "hook".into(), "uninstall".into()]).unwrap();
+        assert!(!dir.join(".git/hooks/post-merge").exists(), "ours must go");
+        assert!(dir.join(".git/hooks/post-checkout").exists(), "foreign must stay");
+        // Non-git dir errors instead of writing stray files.
+        let plain = temp_dir_with_nanos("cx_hook_plain");
+        let _ = std::fs::remove_dir_all(&plain);
+        std::fs::create_dir_all(&plain).unwrap();
+        std::env::set_current_dir(&plain).unwrap();
+        let res = run(vec!["cortex".into(), "hook".into(), "install".into()]);
+        assert!(res.is_err(), "must refuse outside git");
+        std::env::set_current_dir(cwd).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&plain);
     }
 
     #[test]

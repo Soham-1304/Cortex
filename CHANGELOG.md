@@ -111,3 +111,6 @@
   rs/go/js/ts/java into code_refs_use (Go blocks, require/from-forms,
   dotted full+short, def/comment/keyword filtering, decl lookbehind).
   find/map and the refs leg now see callers repo-wide. 115/54 green.
+- Auto-index triggers: `cortex hook install` manages post-merge/post-checkout
+  hooks (absolute binary, .cortex guard, hook.log failures, foreign-safe,
+  worktree-aware, uninstall removes only ours). README points at the command.
