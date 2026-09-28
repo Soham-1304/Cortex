@@ -212,8 +212,9 @@ cortex index .
 ```
 
 Hands-free freshness (opt-in, zero daemon): install git hooks that
-re-index after pulls and branch switches (foreign hooks are never
-overwritten without `--force`):
+re-index after pulls, branch switches, and commits (foreign hooks are never
+overwritten without `--force`). Uncommitted edits still need a manual
+`cortex index .` — there is intentionally no background watcher:
 
 ```bash
 cortex hook install

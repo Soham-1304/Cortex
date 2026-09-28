@@ -116,3 +116,6 @@
   worktree-aware, uninstall removes only ours). README points at the command.
 - Harness gains Oriented@20 (span-hit AND file-hit in top-20): astropy
   0.867, django 0.741, sympy 0.682. Diagnostic only, never a gate.
+- Hooks cover post-commit too (committed edits re-index); uncommitted edits
+  stay manual by design (no daemon watcher — hooks plus notices are the
+  whole freshness story).

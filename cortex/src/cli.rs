@@ -106,9 +106,9 @@ enum Cmd {
         #[arg(long)]
         stdio: bool,
     },
-    /// Git-hook freshness automation: `hook install` writes post-merge +
-    /// post-checkout hooks that re-index after pulls and branch switches.
-    /// Opt-in only — Cortex stays zero-daemon by default.
+    /// Git-hook freshness automation: `hook install` writes post-merge,
+    /// post-checkout, and post-commit hooks that re-index after pulls,
+    /// switches, and commits. Opt-in only — zero-daemon by default.
     Hook {
         #[command(subcommand)]
         sub: HookCmd,
@@ -2031,7 +2031,10 @@ fn hooks_dir(base: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(linked).join("hooks"))
 }
 
-const HOOK_NAMES: &[&str] = &["post-merge", "post-checkout"];
+// post-commit covers committed local edits; uncommitted working-tree edits
+// still need manual `index` or the recall notice — a daemon watcher would
+// break the zero-daemon footprint, so hooks + notices are the whole story.
+const HOOK_NAMES: &[&str] = &["post-merge", "post-checkout", "post-commit"];
 
 fn do_hook_install(force: bool) -> Result<()> {
     let base = current_base();
@@ -2055,7 +2058,7 @@ fn do_hook_install(force: bool) -> Result<()> {
         }
         println!("installed {name}");
     }
-    println!("hooks will run `cortex index .` after pulls and branch switches (only where .cortex exists)");
+    println!("hooks will run `cortex index .` after pulls, switches, and commits (only where .cortex exists)");
     Ok(())
 }
 
@@ -2238,6 +2241,7 @@ mod tests {
         assert!(ours.contains(".cortex"), "must guard on .cortex presence");
         assert!(ours.contains("hook.log"), "failures must land in hook.log");
         // post-checkout installed fresh; both executable.
+        assert!(dir.join(".git/hooks/post-commit").exists(), "post-commit must install");
         let co = dir.join(".git/hooks/post-checkout");
         assert!(co.exists());
         #[cfg(unix)]
