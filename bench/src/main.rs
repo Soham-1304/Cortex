@@ -11,6 +11,7 @@ use bench::eval::{
 };
 use bench::fuse;
 use bench::graph::file_members;
+use bench::eval::oriented_at_k;
 use bench::pack::{self, Item};
 use bench::provider::pick_provider;
 
@@ -22,6 +23,7 @@ struct QueryRun {
     ndcg10_pool: f64,
     recall20_pool: f64,
     file_recall20_pool: f64,
+    oriented20: f64,
     mrr: f64,
     packed_precision: f64,
     packed_recall: f64,
@@ -48,6 +50,7 @@ struct QueryRow {
     ndcg10_pool: f64,
     recall20_pool: f64,
     file_recall20_pool: f64,
+    oriented20: f64,
     mrr: f64,
     packed_precision: f64,
     packed_recall: f64,
@@ -69,6 +72,7 @@ struct Aggregate {
     ndcg10_pool: f64,
     recall20_pool: f64,
     file_recall20_pool: f64,
+    oriented20: f64,
     mrr: f64,
     packed_precision: f64,
     packed_recall: f64,
@@ -407,6 +411,12 @@ fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider
         let recall20_pool = recall_at_k(&pooled_ids, &q.gold, 20);
         let file_recall20_pool =
             file_recall_at_k(&pooled_ids, &id_to_path, &gold_files, 20);
+        // Orientation diagnostic (not a gate): span AND file present.
+        let oriented20 = if oriented_at_k(&pooled_ids, &q.gold, &id_to_path, &gold_files, 20) {
+            1.0
+        } else {
+            0.0
+        };
         let mrr_val = mrr(&ranked_ids, &q.gold);
         let pack_p = set_precision(&sel_ids, &q.gold);
         let pack_r = set_recall(&sel_ids, &q.gold);
@@ -419,6 +429,7 @@ fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider
             ndcg10_pool,
             recall20_pool,
             file_recall20_pool,
+            oriented20,
             mrr: mrr_val,
             packed_precision: pack_p,
             packed_recall: pack_r,            rho_naive,
@@ -589,6 +600,7 @@ fn main() {
                 ndcg10_pool: r.ndcg10_pool,
                 recall20_pool: r.recall20_pool,
                 file_recall20_pool: r.file_recall20_pool,
+                oriented20: r.oriented20,
                 mrr: r.mrr,
                 packed_precision: r.packed_precision,
                 packed_recall: r.packed_recall,
@@ -610,6 +622,7 @@ fn main() {
         let recall_pool_vals: Vec<f64> = runs.iter().map(|r| r.recall20_pool).collect();
         let file_recall_pool_vals: Vec<f64> =
             runs.iter().map(|r| r.file_recall20_pool).collect();
+        let oriented_vals: Vec<f64> = runs.iter().map(|r| r.oriented20).collect();
         let mrr_vals: Vec<f64> = runs.iter().map(|r| r.mrr).collect();
         let pack_p_vals: Vec<f64> = runs.iter().map(|r| r.packed_precision).collect();
         let pack_r_vals: Vec<f64> = runs.iter().map(|r| r.packed_recall).collect();
@@ -623,6 +636,7 @@ fn main() {
             ndcg10_pool: mean(&ndcg_pool_vals),
             recall20_pool: mean(&recall_pool_vals),
             file_recall20_pool: mean(&file_recall_pool_vals),
+            oriented20: mean(&oriented_vals),
             mrr: mean(&mrr_vals),
             packed_precision: mean(&pack_p_vals),
             packed_recall: mean(&pack_r_vals),
@@ -677,6 +691,7 @@ fn main() {
             &file_recall_pool_vals,
             "<- pooled",
         );
+        report("Oriented@20", &oriented_vals, "<- span+file (diagnostic)");
         report("MRR", &mrr_vals, "");
         println!("Packed-context quality (knapsack DP):");
         report("Precision", &pack_p_vals, "");

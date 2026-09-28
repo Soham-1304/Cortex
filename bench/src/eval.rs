@@ -71,6 +71,39 @@ pub fn recall_at_k(ranked: &[String], gold: &[String], k: usize) -> f64 {
     ranked.iter().take(k).filter(|d| g.contains(d)).count() as f64 / gold.len() as f64
 }
 
+/// Orientation check (orientation-first objective): true when the top-k
+/// window holds BOTH a gold span (the definition) and a gold file (the
+/// neighborhood) — the minimum for an agent to get oriented. Callers are
+/// not covered (no call data in bench corpora); documented limitation.
+pub fn oriented_at_k(
+    ranked: &[String],
+    gold: &[String],
+    id_to_path: &HashMap<String, String>,
+    gold_files: &HashSet<String>,
+    k: usize,
+) -> bool {
+    if gold.is_empty() || gold_files.is_empty() {
+        return false;
+    }
+    let g: HashSet<&String> = gold.iter().collect();
+    let mut span = false;
+    let mut file = false;
+    for id in ranked.iter().take(k) {
+        if g.contains(id) {
+            span = true;
+        }
+        if let Some(p) = id_to_path.get(id) {
+            if gold_files.contains(p) {
+                file = true;
+            }
+        }
+        if span && file {
+            return true;
+        }
+    }
+    false
+}
+
 /// File-level recall: fraction of gold *files* with at least one symbol doc
 /// in the top-k ranks. The file-first accuracy metric: a query whose gold
 /// file is found can be completed by within-file search, even when the exact
@@ -170,6 +203,27 @@ pub fn bootstrap_ci(values: &[f64], iters: usize, seed: u64) -> (f64, f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oriented_needs_span_and_file() {
+        use std::collections::HashMap;
+        use std::collections::HashSet;
+        let ranked = vec!["w".to_string(), "g1".to_string(), "v".to_string()];
+        let gold = vec!["g1".to_string(), "g2".to_string()];
+        let mut idp = HashMap::new();
+        idp.insert("w".to_string(), "other.py".to_string());
+        idp.insert("g1".to_string(), "gold.py".to_string());
+        idp.insert("v".to_string(), "gold.py".to_string());
+        let gf: HashSet<String> = HashSet::from(["gold.py".to_string()]);
+        // g1 is both span and file hit.
+        assert!(oriented_at_k(&ranked, &gold, &idp, &gf, 3));
+        assert!(!oriented_at_k(&ranked, &gold, &idp, &gf, 1));
+        // Same-file non-gold alone is not orientation.
+        let ranked2 = vec!["w".to_string(), "v".to_string()];
+        assert!(!oriented_at_k(&ranked2, &gold, &idp, &gf, 3));
+        // Empty gold never orients.
+        assert!(!oriented_at_k(&ranked, &[], &idp, &gf, 3));
+    }
 
     #[test]
     fn ndcg_hand_case() {

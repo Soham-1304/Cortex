@@ -114,3 +114,5 @@
 - Auto-index triggers: `cortex hook install` manages post-merge/post-checkout
   hooks (absolute binary, .cortex guard, hook.log failures, foreign-safe,
   worktree-aware, uninstall removes only ours). README points at the command.
+- Harness gains Oriented@20 (span-hit AND file-hit in top-20): astropy
+  0.867, django 0.741, sympy 0.682. Diagnostic only, never a gate.
