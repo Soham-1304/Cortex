@@ -32,6 +32,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from agent_logger import EpisodeLogger, generate_interactive_html
+
 ROOT = Path(__file__).resolve().parents[2]
 CORTEX = os.environ.get("CORTEX_BIN", str(ROOT / "target" / "release" / "cortex"))
 
@@ -85,17 +87,24 @@ class Llm:
             headers={"Authorization": f"Bearer {self.key}", "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"})
         return json.load(urllib.request.urlopen(req, timeout=timeout))
 
-    def chat(self, messages, tools, tool_choice="auto", max_attempts=8):
+    def chat(self, messages, tools, tool_choice="auto", max_attempts=8, logger=None):
         body = {"model": self.model, "messages": messages, "tools": tools,
                 "tool_choice": tool_choice, "temperature": 0}
         delay = 4.0
         for attempt in range(max_attempts):
             self.calls += 1
+            t_call_0 = time.time()
             try:
                 r = self._post("/chat/completions", body)
+                latency_ms = int((time.time() - t_call_0) * 1000)
                 u = r.get("usage") or {}
-                self.prompt_tokens += u.get("prompt_tokens", 0)
-                self.completion_tokens += u.get("completion_tokens", 0)
+                p_tok = u.get("prompt_tokens", 0)
+                c_tok = u.get("completion_tokens", 0)
+                self.prompt_tokens += p_tok
+                self.completion_tokens += c_tok
+                if logger:
+                    logger.record_attempt(attempt + 1, 200, wait_s=0, prompt_tokens=p_tok,
+                                          completion_tokens=c_tok, latency_ms=latency_ms)
                 return r["choices"][0]["message"]
             except urllib.error.HTTPError as e:
                 detail = e.read().decode("utf-8", "replace")[:300]
@@ -105,6 +114,8 @@ class Llm:
                     for m in messages:
                         if m.get("role") == "tool" and len(m.get("content", "")) > 150:
                             m["content"] = m["content"][:100] + "\n...[trimmed]"
+                    if logger:
+                        logger.record_attempt(attempt + 1, 413, wait_s=2.0, error_msg=detail)
                     time.sleep(2)
                     continue
                 if e.code in (429, 500, 502, 503, 504) and attempt < max_attempts - 1:
@@ -125,13 +136,19 @@ class Llm:
                                 wait = max(wait, float(reset_tok.rstrip("s")))
                         except Exception:
                             pass
-                    time.sleep(min(wait + 1.0, 60))
+                    actual_wait = min(wait + 1.0, 60)
+                    if logger:
+                        logger.record_attempt(attempt + 1, e.code, wait_s=actual_wait,
+                                              error_msg=detail, headers=dict(e.headers))
+                    time.sleep(actual_wait)
                     delay *= 2
                     continue
                 raise RuntimeError(f"HTTP {e.code}: {detail}")
-            except (urllib.error.URLError, TimeoutError):
+            except (urllib.error.URLError, TimeoutError) as ex:
                 if attempt < max_attempts - 1:
                     self.retries += 1
+                    if logger:
+                        logger.record_attempt(attempt + 1, 599, wait_s=delay, error_msg=str(ex))
                     time.sleep(delay)
                     delay *= 2
                     continue
@@ -256,7 +273,7 @@ SYSTEM = ("You are an expert code-localization agent. Given a bug report, find t
 
 
 # ----------------------------------------------------------------- one episode
-def run_episode(llm, repo, workdir, issue, arm, max_steps):
+def run_episode(llm, repo, workdir, issue, arm, max_steps, logger=None):
     use_tool = arm == "tool"
     msgs = [{"role": "system", "content": SYSTEM}]
     prompt = f"Bug report:\n{issue[:4000]}\n"
@@ -278,16 +295,22 @@ def run_episode(llm, repo, workdir, issue, arm, max_steps):
     read_history = []
     try:
         for step in range(max_steps):
+            if logger:
+                logger.start_turn(step + 1)
             last = step == max_steps - 1
             if last:
                 msgs.append({"role": "user", "content": "This is your final step. You must call submit now with your best estimate."})
             msgs = prune_messages(msgs)
-            msg = llm.chat(msgs, specs, tool_choice="auto")
+            msg = llm.chat(msgs, specs, tool_choice="auto", logger=logger)
             steps += 1
             msgs.append({k: v for k, v in msg.items() if v is not None})
+            if logger and msg.get("content"):
+                logger.record_model_response(msg.get("content"))
             tcs = msg.get("tool_calls") or []
             if not tcs:
                 msgs.append({"role": "user", "content": "Use the tools; call `submit` when done."})
+                if logger:
+                    logger.end_turn()
                 continue
             for tc in tcs:
                 name = tc["function"]["name"]
@@ -296,6 +319,7 @@ def run_episode(llm, repo, workdir, issue, arm, max_steps):
                 except json.JSONDecodeError:
                     args = {}
                 tool_calls += 1
+                t_tool_0 = time.time()
                 if name == "submit":
                     locs = args.get("locations")
                     if locs is None and "file" in args:
@@ -320,14 +344,23 @@ def run_episode(llm, repo, workdir, issue, arm, max_steps):
                     cortex_ms += int((time.time() - c0) * 1000)
                 else:
                     out = f"unknown tool {name}"
+                dur_ms = int((time.time() - t_tool_0) * 1000)
+                if logger:
+                    logger.record_tool_call(name, args, out, dur_ms)
                 msgs.append({"role": "tool", "tool_call_id": tc.get("id", name), "content": out})
+            if logger:
+                logger.end_turn()
             if final is not None:
                 break
         if final is None and not err:
             # One explicit submission turn if loop ended without submit
+            if logger:
+                logger.start_turn(steps + 1)
             msgs.append({"role": "user", "content": "Investigation finished. Call `submit` now with the code locations to fix."})
-            msg = llm.chat(prune_messages(msgs), specs, tool_choice="auto")
+            msg = llm.chat(prune_messages(msgs), specs, tool_choice="auto", logger=logger)
             steps += 1
+            if logger and msg.get("content"):
+                logger.record_model_response(msg.get("content"))
             tcs = msg.get("tool_calls") or []
             for tc in tcs:
                 if tc["function"]["name"] == "submit":
@@ -341,6 +374,8 @@ def run_episode(llm, repo, workdir, issue, arm, max_steps):
                     elif isinstance(locs, dict):
                         locs = [locs]
                     final = locs if isinstance(locs, list) else []
+                    if logger:
+                        logger.record_tool_call("submit", args, "submitted", 0)
             if final is None and msg.get("content"):
                 matches = re.findall(r'([\w/.-]+\.(?:py|rs|js|ts|c|h))\b(?:[^\n\d]*lines?\s*(\d+)(?:\s*-\s*(\d+))?)?', msg.get("content", ""))
                 if matches:
@@ -354,6 +389,8 @@ def run_episode(llm, repo, workdir, issue, arm, max_steps):
                         final = recovered
             if final is None and read_history:
                 final = read_history[-3:]
+            if logger:
+                logger.end_turn()
     except Exception as e:  # keep the run going; record the failure
         err = str(e)[:300]
     return {
@@ -446,8 +483,15 @@ def main():
     ap.add_argument("--arms", default="base,tool,prefetch")
     ap.add_argument("--max-steps", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--logs-dir", default=str(ROOT / "bench" / "results" / "logs"))
     a = ap.parse_args()
     arms = a.arms.split(",")
+    logs_dir = Path(a.logs_dir)
+    episodes_dir = logs_dir / "episodes"
+    markdown_dir = logs_dir / "markdown"
+    episodes_dir.mkdir(parents=True, exist_ok=True)
+    markdown_dir.mkdir(parents=True, exist_ok=True)
+
     tasks = [json.loads(l) for l in open(f"{a.fixtures}/tasks.jsonl") if l.strip()]
     random.Random(a.seed).shuffle(tasks)
     if a.limit:
@@ -469,9 +513,26 @@ def main():
             order = arms[:]
             random.Random(__import__("zlib").crc32(t["instance_id"].encode())).shuffle(order)
             for arm in order:
-                r = run_episode(llm, a.repo, a.workdir, t["problem_statement"], arm, a.max_steps)
-                r.update(score(r["final"], gold))
+                logger = EpisodeLogger(
+                    task_id=t["instance_id"],
+                    repo=t.get("repo", Path(a.repo).name),
+                    language=t.get("language", "Unknown"),
+                    arm=arm,
+                    model=a.model,
+                    problem_statement=t["problem_statement"],
+                    gold_context=gold,
+                )
+                r = run_episode(llm, a.repo, a.workdir, t["problem_statement"], arm, a.max_steps, logger=logger)
+                sc = score(r["final"], gold)
+                r.update(sc)
                 row[arm] = r
+                
+                logger.finish(r["final"], sc, r["error"])
+                clean_id = t["instance_id"].replace("/", "__")
+                logger.save_json(episodes_dir / f"{clean_id}_{arm}.json")
+                logger.save_markdown(markdown_dir / f"{clean_id}_{arm}.md")
+                generate_interactive_html(episodes_dir, logs_dir / "index.html")
+
                 print(f"{t['instance_id'][-8:]} {arm:8s} turns={r['turns']:2d} calls={r['api_calls']:2d} "
                       f"tok={r['prompt_tokens']+r['completion_tokens']:6d} f1={r['file_f1']:.2f} "
                       f"span={r['span_recall']:.2f} lines={r['line_recall']:.2f}"
