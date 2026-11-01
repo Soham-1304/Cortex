@@ -51,20 +51,74 @@ PROVIDERS = {
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"),
 }
 SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules", "dist", "build", ".cortex", ".tox"}
-TOOL_OUT_CHARS = 3000   # identical truncation in every arm
-READ_MAX_LINES = 100
+TOOL_OUT_CHARS = 2500   # identical truncation in every arm
+READ_MAX_LINES = 80
 
 
-def prune_messages(msgs, max_chars=12000):
-    total = sum(len(str(m.get("content", ""))) for m in msgs)
-    if total <= max_chars:
-        return msgs
+class RollingTokenLimiter:
+    """Enforces strict rolling Tokens Per Minute (TPM) quota to prevent HTTP 429 stalls."""
+    def __init__(self, max_tpm=12000, window_s=60.0):
+        self.max_tpm = max_tpm
+        self.window_s = window_s
+        self.history = []  # list of (timestamp, token_count)
+
+    def _prune(self, now):
+        cutoff = now - self.window_s
+        self.history = [(t, tok) for t, tok in self.history if t > cutoff]
+
+    def current_usage(self):
+        now = time.time()
+        self._prune(now)
+        return sum(tok for _, tok in self.history)
+
+    def wait_if_needed(self, estimated_tokens=1800, logger=None):
+        now = time.time()
+        self._prune(now)
+        current = sum(tok for _, tok in self.history)
+        while current + estimated_tokens > self.max_tpm and self.history:
+            oldest_t, _ = self.history[0]
+            sleep_s = max(1.0, (oldest_t + self.window_s) - time.time() + 0.5)
+            if logger:
+                logger.record_attempt(1, 429, wait_s=round(sleep_s, 1),
+                                      error_msg=f"Proactive TPM limit pacing ({current:,}/{self.max_tpm:,} tokens)")
+            print(f" [TPM Pacer: {current:,}/{self.max_tpm:,} tok, cooling {sleep_s:.1f}s]...", end="", flush=True)
+            time.sleep(sleep_s)
+            now = time.time()
+            self._prune(now)
+            current = sum(tok for _, tok in self.history)
+
+    def record_usage(self, tokens):
+        now = time.time()
+        self.history.append((now, tokens))
+        self._prune(now)
+
+
+GLOBAL_TOKEN_LIMITER = RollingTokenLimiter(max_tpm=12000, window_s=60.0)
+
+
+def prune_messages(msgs, max_chars=8000):
+    # 1. Truncate older tool outputs
     tool_indices = [i for i, m in enumerate(msgs) if m.get("role") == "tool"]
-    to_prune = tool_indices[:-2] if len(tool_indices) > 2 else tool_indices[:-1]
+    to_prune = tool_indices[:-1] if len(tool_indices) > 1 else []
     for idx in to_prune:
-        c = msgs[idx].get("content", "")
-        if len(c) > 300:
-            msgs[idx]["content"] = c[:200] + "\n...[trimmed to conserve context]"
+        c = str(msgs[idx].get("content", ""))
+        if len(c) > 250:
+            msgs[idx]["content"] = c[:180] + "\n...[trimmed to conserve tokens]"
+
+    # 2. Strip verbose <thought> tags from historical assistant messages
+    for m in msgs:
+        if m.get("role") == "assistant" and m.get("content"):
+            c = str(m["content"])
+            if "<thought>" in c and "</thought>" in c:
+                m["content"] = re.sub(r'<thought>.*?</thought>', '', c, flags=re.DOTALL).strip()
+
+    # 3. If total characters still exceed max_chars, prune earlier messages
+    total = sum(len(str(m.get("content", ""))) for m in msgs)
+    if total > max_chars and len(tool_indices) > 0:
+        for idx in tool_indices:
+            c = str(msgs[idx].get("content", ""))
+            if len(c) > 120:
+                msgs[idx]["content"] = c[:100] + "\n...[trimmed]"
     return msgs
 
 
@@ -93,6 +147,8 @@ class Llm:
         delay = 4.0
         for attempt in range(max_attempts):
             self.calls += 1
+            # Proactively enforce rolling TPM limits before sending HTTP request
+            GLOBAL_TOKEN_LIMITER.wait_if_needed(estimated_tokens=1800, logger=logger)
             t_call_0 = time.time()
             try:
                 r = self._post("/chat/completions", body)
@@ -102,6 +158,7 @@ class Llm:
                 c_tok = u.get("completion_tokens", 0)
                 self.prompt_tokens += p_tok
                 self.completion_tokens += c_tok
+                GLOBAL_TOKEN_LIMITER.record_usage(p_tok + c_tok)
                 if logger:
                     logger.record_attempt(attempt + 1, 200, wait_s=0, prompt_tokens=p_tok,
                                           completion_tokens=c_tok, latency_ms=latency_ms)
@@ -276,7 +333,7 @@ SYSTEM = ("You are an expert code-localization agent. Given a bug report, find t
 def run_episode(llm, repo, workdir, issue, arm, max_steps, logger=None):
     use_tool = arm == "tool"
     msgs = [{"role": "system", "content": SYSTEM}]
-    prompt = f"Bug report:\n{issue[:4000]}\n"
+    prompt = f"Bug report:\n{issue[:2500]}\n"
     t0 = time.time()
     cortex_ms = 0
     if arm == "prefetch":
@@ -303,9 +360,17 @@ def run_episode(llm, repo, workdir, issue, arm, max_steps, logger=None):
             msgs = prune_messages(msgs)
             msg = llm.chat(msgs, specs, tool_choice="auto", logger=logger)
             steps += 1
-            msgs.append({k: v for k, v in msg.items() if v is not None})
             if logger and msg.get("content"):
                 logger.record_model_response(msg.get("content"))
+            # Clean assistant message for ongoing history: strip thought blocks to conserve tokens
+            raw_c = msg.get("content") or ""
+            clean_c = re.sub(r'<thought>.*?</thought>', '', raw_c, flags=re.DOTALL).strip()
+            asst_msg = {"role": "assistant"}
+            if clean_c:
+                asst_msg["content"] = clean_c
+            if msg.get("tool_calls"):
+                asst_msg["tool_calls"] = msg["tool_calls"]
+            msgs.append(asst_msg)
             tcs = msg.get("tool_calls") or []
             if not tcs:
                 msgs.append({"role": "user", "content": "Use the tools; call `submit` when done."})

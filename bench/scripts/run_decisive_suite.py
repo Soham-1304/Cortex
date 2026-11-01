@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Decisive 72-Task Suite Runner for Cortex vs Baseline on Gemini 3.5 Flash.
+"""Decisive 72-Task Suite Runner for Cortex vs Baseline on Google Gemma 4 26B Instruct.
 
 Orchestrates the head-to-head evaluation across 72 real tasks (12 per language across 6 languages):
 - Evaluates Cortex Arm (cortex_search tool) vs Baseline Arm (grep / read_file)
@@ -7,7 +7,7 @@ Orchestrates the head-to-head evaluation across 72 real tasks (12 per language a
   - bench/results/logs/episodes/<task_id>_<arm>.json
   - bench/results/logs/markdown/<task_id>_<arm>.md
   - bench/results/logs/index.html (live interactive viewer)
-- Pacing between tasks to respect Gemini TPM quotas and prevent rate limit thrashing
+- Proactive Token Bucket Limiter to strictly respect Google AI Studio 16K TPM free quota
 """
 
 import argparse
@@ -84,7 +84,7 @@ def ensure_repo_and_index(repo_name, repo_url=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="models/gemini-3.5-flash")
+    ap.add_argument("--model", default="models/gemma-4-26b-a4b-it")
     ap.add_argument("--provider", default="gemini")
     ap.add_argument("--arms", default="tool,base")
     ap.add_argument("--language", default="ALL", help="Filter by language (e.g. Python, Rust, Go, or ALL)")
@@ -102,6 +102,14 @@ def main():
     # Filter tasks by language
     if args.language != "ALL":
         all_tasks = [t for t in all_tasks if t["language"].lower() == args.language.lower()]
+
+    if args.limit_per_lang and args.limit_per_lang < 12:
+        import collections
+        by_lang = collections.defaultdict(list)
+        for t in all_tasks:
+            if len(by_lang[t["language"]]) < args.limit_per_lang:
+                by_lang[t["language"]].append(t)
+        all_tasks = [t for tasks in by_lang.values() for t in tasks]
 
     arms = [a.strip() for a in args.arms.split(",")]
     EPISODES_DIR.mkdir(parents=True, exist_ok=True)
@@ -143,16 +151,16 @@ def main():
             domain = t.get("domain", "")
 
             if t_id in done_records:
-                print(f"[{idx}/{total}] SKIP (already done): {t_id[-12:]} ({repo_name})")
+                print(f"[{idx}/{total}] SKIP (already done): {t_id[-12:]} ({repo_name})", flush=True)
                 continue
 
-            print(f"\n[{idx}/{total}] TASK: {t_id[-12:]} | {lang} | {repo_name} ({domain})")
-            print(f"  Issue: {t['problem_statement'][:100].replace(chr(10), ' ')}...")
+            print(f"\n[{idx}/{total}] TASK: {t_id[-12:]} | {lang} | {repo_name} ({domain})", flush=True)
+            print(f"  Issue: {t['problem_statement'][:100].replace(chr(10), ' ')}...", flush=True)
 
             try:
                 repo_path, work_path = ensure_repo_and_index(repo_name, t.get("repo_url"))
             except Exception as ex:
-                print(f"  [ERROR] Failed to prepare repo {repo_name}: {ex}")
+                print(f"  [ERROR] Failed to prepare repo {repo_name}: {ex}", flush=True)
                 continue
 
             gold = t.get("gold_context", [])
@@ -200,7 +208,7 @@ def main():
                 print(f"done in {r['wall_s']}s (cogn={logger.cognitive_s}s, 429_wait={logger.rate_limit_wait_s}s) | "
                       f"turns={r['turns']} tok={r['prompt_tokens']+r['completion_tokens']} | F1={f1:.2f} "
                       f"{'[SOLVED]' if f1 == 1.0 else '[PARTIAL]' if f1 > 0 else '[FAIL]'} "
-                      f"{f'⚠️ {retries} retries' if retries else ''}")
+                      f"{f'⚠️ {retries} retries' if retries else ''}", flush=True)
 
                 # Pacing sleep between arms to prevent quota spikes
                 if args.pacing_delay > 0:
@@ -214,11 +222,11 @@ def main():
             if args.pacing_delay > 0:
                 time.sleep(args.pacing_delay)
 
-    print("\n" + "=" * 80)
-    print(f"SUITE COMPLETE: Evaluated {completed} tasks.")
-    print(f"Results saved to: {OUT_RESULTS}")
-    print(f"Interactive Dashboard updated: {INDEX_HTML}")
-    print("=" * 80)
+    print("\n" + "=" * 80, flush=True)
+    print(f"SUITE COMPLETE: Evaluated {completed} tasks.", flush=True)
+    print(f"Results saved to: {OUT_RESULTS}", flush=True)
+    print(f"Interactive Dashboard updated: {INDEX_HTML}", flush=True)
+    print("=" * 80, flush=True)
 
 
 if __name__ == "__main__":
