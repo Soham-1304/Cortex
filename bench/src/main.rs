@@ -315,6 +315,10 @@ fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider
         };
         let fused = if let Some((w_bm25, w_cos)) = crrf_weights {
             fuse::rrf_weighted(&[r_bm25, r_cos], &[w_bm25, w_cos], texts.len())
+        } else if fuse_mode == "bm25" {
+            fuse::rrf(&[r_bm25], texts.len())
+        } else if fuse_mode == "cos" {
+            fuse::rrf(&[r_cos], texts.len())
         } else if fuse_mode == "rrf3" {
             // Third RRF leg: exact identifier hits (IDF-weighted, generic-gated).
             // Absent leg (no exact hits) contributes nothing — today's behavior.

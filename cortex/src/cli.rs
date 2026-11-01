@@ -1024,7 +1024,10 @@ fn do_digest(summary: Option<String>, tokens: i64) -> Result<()> {
 
 const SKIP_DIRS: &[&str] = &["test", "tests", "docs", "examples", "node_modules", ".git", "target", ".cortex",
     "vendor", "dist", "build", ".venv", "__pycache__", "Pods", ".next", ".nuxt", "coverage", ".tox"];
-const EXTS: &[&str] = &[".py", ".rs", ".go", ".java", ".js", ".ts", ".tsx"];
+const EXTS: &[&str] = &[
+    ".py", ".rs", ".go", ".java", ".js", ".ts", ".tsx",
+    ".c", ".cpp", ".cc", ".cxx", ".h", ".hpp",
+];
 const EMBED_BATCH: usize = 100;
 /// Max chars per text sent to an embedding provider. Poison-batch guard:
 /// one giant symbol text used to 500 the whole request and (via `?`)
@@ -1162,6 +1165,48 @@ fn extract_name_from_line(line: &str) -> Option<(String, String, String)> {
                 }
             }
         }
+    }
+    if let Some((name, sig)) = parse_c_like_fn(trimmed, line) {
+        return Some((name, "function".to_string(), sig));
+    }
+    None
+}
+
+fn parse_c_like_fn(trimmed: &str, line: &str) -> Option<(String, String)> {
+    if trimmed.starts_with("//") || trimmed.starts_with("/*") || trimmed.starts_with('#') {
+        return None;
+    }
+    let open_paren = trimmed.find('(')?;
+    let close_paren = trimmed.find(')')?;
+    if close_paren < open_paren {
+        return None;
+    }
+    let before_paren = trimmed[..open_paren].trim_end();
+    if before_paren.is_empty() || before_paren.contains('=') {
+        return None;
+    }
+    let tokens: Vec<&str> = before_paren.split_whitespace().collect();
+    if tokens.len() < 2 {
+        return None;
+    }
+    let last_token = *tokens.last()?;
+    let name: String = last_token
+        .trim_start_matches(['*', '&'])
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() || USE_STOP.contains(&name.as_str()) {
+        return None;
+    }
+    let after_paren = trimmed[close_paren + 1..].trim();
+    if after_paren.starts_with('{')
+        || after_paren.is_empty()
+        || after_paren.starts_with("const")
+        || after_paren.starts_with("throws")
+        || after_paren.starts_with("override")
+        || after_paren.starts_with(';')
+    {
+        return Some((name, line.trim().to_string()));
     }
     None
 }
@@ -1342,6 +1387,19 @@ fn parse_import_generic(t: &str, lang: &str) -> Option<(String, String, Option<S
             }
             Some((name.to_string(), "import".into(), None))
         }
+        "c" | "cpp" | "cc" | "cxx" | "h" | "hpp" => {
+            let rest = t.strip_prefix("#include")?.trim();
+            if rest.starts_with('<') {
+                let name = rest.trim_matches(['<', '>']).trim();
+                if !name.is_empty() {
+                    Some((name.to_string(), "import".into(), None))
+                } else {
+                    None
+                }
+            } else {
+                quoted_mod(rest).map(|m| (m, "import".into(), None))
+            }
+        }
         _ => None,
     }
 }
@@ -1383,7 +1441,7 @@ fn extract_uses_generic(text: &str, lang: &str) -> RefUsesVec {
                 continue;
             }
         }
-        if t.starts_with("//") || t.starts_with('#') || t.starts_with("/*") || t.starts_with('*') || t.starts_with("<!--") {
+        if t.starts_with("//") || (t.starts_with('#') && !t.starts_with("#include")) || t.starts_with("/*") || t.starts_with('*') || t.starts_with("<!--") {
             continue;
         }
         // Definition lines: names live in code_refs_def, not here.
@@ -2268,6 +2326,15 @@ mod tests {
         assert!(has(&java, "helper", "call"), "{java:?}");
         assert!(!has(&java, "m", "call"), "method def leaked: {java:?}");
         assert!(!has(&java, "A", "call"), "class leaked: {java:?}");
+        // C/C++: #include + calls; `void compute()` skipped.
+        let cpp = extract_uses_generic(
+            "#include <vector>\n#include \"my_header.h\"\nvoid compute() {\n    init_vector();\n}\n",
+            "cpp",
+        );
+        assert!(has(&cpp, "vector", "import"), "{cpp:?}");
+        assert!(has(&cpp, "my_header.h", "import"), "{cpp:?}");
+        assert!(has(&cpp, "init_vector", "call"), "{cpp:?}");
+        assert!(!has(&cpp, "compute", "call"), "method def leaked: {cpp:?}");
     }
 
     #[test]

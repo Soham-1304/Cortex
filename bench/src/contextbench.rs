@@ -62,8 +62,13 @@ pub fn load_dir(dir: &Path) -> Result<Corpus, String> {
         let spans = parse_gold_spans(&task.gold_context);
         let mut gold: Vec<String> = Vec::new();
         for span in &spans {
+            let span_clean = span.file.trim_start_matches('/');
             for doc in &docs {
-                if doc.path == span.file
+                let doc_clean = doc.path.trim_start_matches('/');
+                let matches_path = doc_clean == span_clean
+                    || span_clean.ends_with(doc_clean)
+                    || doc_clean.ends_with(span_clean);
+                if matches_path
                     && spans_overlap(
                         doc.line_start,
                         doc.line_end,
