@@ -310,7 +310,7 @@ fn build_runs(corpus: &Corpus, budget: i64, prov: &dyn bench::provider::Provider
         let qvec = prov.embed_one(&q.text).unwrap_or_else(|_| bench::embed::embed(&q.text));
         let r_cos = {
             let mut sims: Vec<(usize, f32)> = doc_vecs.iter().enumerate().map(|(i, d)| (i, bench::provider::cosine_generic(&qvec, d))).collect();
-            sims.sort_by(|a,b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            sims.sort_by(|a,b| b.1.total_cmp(&a.1));
             sims.into_iter().map(|(i,_)| i).collect::<Vec<usize>>()
         };
         let fused = if let Some((w_bm25, w_cos)) = crrf_weights {
@@ -503,7 +503,7 @@ fn finalize(runs: &mut [QueryRun], tau_low: f64) -> (f64, f64, f64, f64, f64, f6
         }
         means.push(s / n as f64);
     }
-    means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    means.sort_by(|a, b| a.total_cmp(b));
     let lo = means[((n_it as f64 * 0.025) as usize).min(n_it - 1)];
     let hi = means[((n_it as f64 * 0.975) as usize).min(n_it - 1)];
 

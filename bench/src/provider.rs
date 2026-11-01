@@ -57,7 +57,7 @@ impl Provider for OllamaProvider {
         if texts.is_empty() { return Ok(vec![]); }
         eprintln!("[bench] ollama embedding {} texts (768d, truncated 1800ch, 4 threads) ...", texts.len());
         let n_threads = 4;
-        let chunk = (texts.len() + n_threads - 1) / n_threads;
+        let chunk = texts.len().div_ceil(n_threads);
         let mut handles = Vec::new();
         for (chunk_idx, chunk_texts) in texts.chunks(chunk).enumerate() {
             let chunk_vec: Vec<String> = chunk_texts.to_vec();
@@ -178,7 +178,7 @@ pub fn pick_provider(flag: &str) -> Box<dyn Provider> {
             if key.is_empty() { eprintln!("OPENAI_API_KEY not set, falling back to hash"); Box::new(HashProvider) }
             else { Box::new(OpenAIProvider{ api_key: key, model: "text-embedding-3-large".into() }) }
         },
-        "auto" | _ => {
+        _ => {
             let oll = OllamaProvider::new("http://localhost:11434", "nomic-embed-text");
             if oll.health().is_ok() {
                 eprintln!("[bench] using ollama/nomic-embed-text 768d");

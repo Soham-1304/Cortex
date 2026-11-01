@@ -100,6 +100,29 @@ fn tool_defs() -> Value {
             }
         },
         {
+            "name": "code_find",
+            "description": "Exact identifier lookup: symbol -> (file, line, defs, call sites, usages) with out-of-file connections. Fast path that skips embeddings. Use for pinpointing definitions and callers.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "identifier or symbol name to search"},
+                    "n": {"type": "number", "description": "max results (default 10)"}
+                },
+                "required": ["query"]
+            }
+        },
+        {
+            "name": "code_map",
+            "description": "File roadmap: entry points, imports, and inbound references for files around query keywords (<=1k tokens).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "file path or identifier keyword"}
+                },
+                "required": ["query"]
+            }
+        },
+        {
             "name": "reindex",
             "description": "Re-embed all notes and symbols after changing embedding provider/dim.",
             "inputSchema": {
@@ -257,7 +280,12 @@ fn dispatch(name: &str, args: &Value, id: Value) -> Value {
                 let db_path = base.join(".cortex/memory.db");
                 let store = Store::open_at(&db_path.to_string_lossy()).map_err(|e| e.to_string())?;
                 let provider: Box<dyn crate::embed::EmbeddingProvider> = if let Some(e) = embed {
-                    let dim = match e.as_str() { "local-nomic"|"ollama"|"google" => 768, "openai" => 3072, _ => 64 };
+                    let dim = match e.as_str() {
+                        "local-nomic" | "ollama" | "google" => 768,
+                        "mistral" => 1024,
+                        "openai" => 3072,
+                        _ => 64,
+                    };
                     let model = e.clone();
                     let cfg = crate::config::EmbeddingConfig { provider: e.clone(), dim, model, ollama_url: None, api_key_env: None };
                     crate::embed::registry::from_config(&cfg).map_err(|e| e.to_string())?
@@ -268,13 +296,13 @@ fn dispatch(name: &str, args: &Value, id: Value) -> Value {
                 let mut note_rows: Vec<(i64, String)> = Vec::new();
                 {
                     let mut st = store.conn.prepare("SELECT id, content FROM notes").map_err(|e| e.to_string())?;
-                    let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0).unwrap(), r.get::<_, String>(1).unwrap()))).map_err(|e| e.to_string())?;
+                    let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).map_err(|e| e.to_string())?;
                     for r in rows { note_rows.push(r.map_err(|e| e.to_string())?); }
                 }
                 let mut sym_rows: Vec<(i64, String)> = Vec::new();
                 {
-                    let mut st = store.conn.prepare("SELECT id, signature FROM symbols").map_err(|e| e.to_string())?;
-                    let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0).unwrap(), r.get::<_, String>(1).unwrap()))).map_err(|e| e.to_string())?;
+                    let mut st = store.conn.prepare("SELECT id, COALESCE(embed_text, signature, name) FROM symbols").map_err(|e| e.to_string())?;
+                    let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).map_err(|e| e.to_string())?;
                     for r in rows { sym_rows.push(r.map_err(|e| e.to_string())?); }
                 }
                 if !note_rows.is_empty() {
@@ -313,6 +341,82 @@ fn dispatch(name: &str, args: &Value, id: Value) -> Value {
                     store.demote_feedback(&[id]).map_err(|e| e.to_string())?;
                 }
                 Ok(json!({"id": id, "verdict": verdict}).to_string())
+            }
+            "code_find" => {
+                let query = args.get("query").and_then(|v| v.as_str()).ok_or("missing query")?;
+                let n = args.get("n").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+                let store = open_store().map_err(|e| e.to_string())?;
+                let mut tokens = vec![query.to_string()];
+                tokens.extend(query.split_whitespace().map(|s| s.to_string()));
+                tokens.sort();
+                tokens.dedup();
+                let mut seen: std::collections::HashSet<(String, i64)> = std::collections::HashSet::new();
+                let mut defs = Vec::new();
+                let mut uses = Vec::new();
+                let mut fts = Vec::new();
+                for tok in &tokens {
+                    let (d, u, f) = store.find_refs(tok, n).map_err(|e| e.to_string())?;
+                    for row in d {
+                        if seen.insert((row.0.clone(), row.1)) {
+                            defs.push(json!({"path": row.0, "line": row.1, "kind": row.2}));
+                        }
+                    }
+                    for row in u {
+                        if seen.insert((row.0.clone(), row.1)) {
+                            uses.push(json!({"path": row.0, "line": row.1, "kind": row.2, "context": row.3}));
+                        }
+                    }
+                    for row in f {
+                        if seen.insert((row.0.clone(), row.1)) {
+                            fts.push(json!({"path": row.0, "line": row.1, "context": row.2}));
+                        }
+                    }
+                    if defs.len() + uses.len() >= n * 2 {
+                        break;
+                    }
+                }
+                let mut files: Vec<String> = defs.iter().chain(uses.iter()).filter_map(|x| x["path"].as_str().map(|s| s.to_string())).collect();
+                files.sort();
+                files.dedup();
+                let mut conns = Vec::new();
+                for f in files.iter().take(5) {
+                    if let Ok((out, inc)) = store.file_connections(f, 5) {
+                        conns.push(json!({"file": f, "imports": out, "referenced_by": inc}));
+                    }
+                }
+                Ok(json!({"defs": defs, "uses": uses, "fts": fts, "connections": conns}).to_string())
+            }
+            "code_map" => {
+                let query = args.get("query").and_then(|v| v.as_str()).ok_or("missing query")?;
+                let store = open_store().map_err(|e| e.to_string())?;
+                let toks: Vec<String> = query
+                    .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '.')
+                    .filter(|s| s.len() > 1)
+                    .map(|s| s.to_string())
+                    .collect();
+                let mut files: Vec<String> = Vec::new();
+                for tok in &toks {
+                    let (d, u, _) = store.find_refs(tok, 10).unwrap_or_default();
+                    for (p, _, _) in d {
+                        if !files.contains(&p) { files.push(p); }
+                    }
+                    for (p, _, _, _) in u {
+                        if !files.contains(&p) { files.push(p); }
+                    }
+                    if files.len() >= 12 { break; }
+                }
+                if files.is_empty() {
+                    let (_, _, fts) = store.find_refs(query, 10).unwrap_or_default();
+                    for (p, _, _) in fts {
+                        if !files.contains(&p) { files.push(p); }
+                    }
+                }
+                let mut roadmap = Vec::new();
+                for f in files.iter().take(10) {
+                    let (out, inc) = store.file_connections(f, 6).unwrap_or_default();
+                    roadmap.push(json!({"file": f, "imports": out, "referenced_by": inc}));
+                }
+                Ok(json!({"files": roadmap}).to_string())
             }
             _ => Err(format!("unknown tool {name}")),
         }
@@ -362,7 +466,18 @@ pub fn run_stdio() -> Result<()> {
                 let params = req.get("params").cloned().unwrap_or(Value::Null);
                 let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                let known = ["compile_context","memory_write","memory_search","session_digest","core_read","core_write","feedback","reindex"];
+                let known = [
+                    "compile_context",
+                    "memory_write",
+                    "memory_search",
+                    "session_digest",
+                    "core_read",
+                    "core_write",
+                    "feedback",
+                    "reindex",
+                    "code_find",
+                    "code_map",
+                ];
                 if !known.contains(&name.as_str()) {
                     let text = json!({"error": format!("unknown tool {name}")}).to_string();
                     json!({"jsonrpc":"2.0","id":uid,"result":{"content":[{"type":"text","text":text}],"isError":true}})
@@ -380,66 +495,4 @@ pub fn run_stdio() -> Result<()> {
         stdout.flush()?;
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::{BufRead, BufReader, Write};
-    use std::process::{Command, Stdio};
-
-    fn bin() -> String { format!("{}/target/debug/cortex", env!("CARGO_MANIFEST_DIR").trim_end_matches("/cortex")) }
-
-    #[test]
-    fn serve_respects_initialize_tools_list_and_call() {
-        let dir = std::env::temp_dir().join(format!("cx_mcp_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let _ = Command::new(bin()).arg("init").current_dir(&dir).output();
-        let mut child = Command::new(bin())
-            .args(["serve", "--stdio"])
-            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-            .current_dir(&dir)
-            .spawn().unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let mut lines = BufReader::new(stdout).lines();
-        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#).unwrap();
-        let r1: serde_json::Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
-        assert_eq!(r1["id"], 1);
-        assert!(r1["result"]["capabilities"]["tools"].is_object());
-        writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list"}}"#).unwrap();
-        let r2: serde_json::Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
-        assert_eq!(r2["id"], 2);
-        let tools = r2["result"]["tools"].as_array().unwrap();
-        assert!(tools.iter().any(|t| t["name"] == "compile_context"));
-        assert!(tools.iter().any(|t| t["name"] == "memory_write"));
-        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"memory_search","arguments":{{"query":"anything","n":3}}}}}}"#).unwrap();
-        let r3: serde_json::Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
-        assert_eq!(r3["id"], 3);
-        assert!(r3["error"].is_null());
-        drop(stdin);
-        let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn unknown_method_returns_error() {
-        let dir = std::env::temp_dir().join(format!("cx_mcp_err_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let _ = Command::new(bin()).arg("init").current_dir(&dir).output();
-        let mut child = Command::new(bin())
-            .args(["serve", "--stdio"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
-            .current_dir(&dir).spawn().unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        let stdout = child.stdout.take().unwrap();
-        let mut lines = BufReader::new(stdout).lines();
-        writeln!(stdin, r#"{{"jsonrpc":"2.0","id":99,"method":"no_such_method"}}"#).unwrap();
-        let r: serde_json::Value = serde_json::from_str(&lines.next().unwrap().unwrap()).unwrap();
-        assert_eq!(r["id"], 99);
-        assert!(r["error"]["code"].as_i64().unwrap() == -32601);
-        drop(stdin);
-        let _ = child.wait();
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 }

@@ -50,9 +50,9 @@ CREATE TABLE IF NOT EXISTS code_refs_use(
   id INTEGER PRIMARY KEY, path TEXT NOT NULL, name TEXT NOT NULL,
   kind TEXT NOT NULL, line INTEGER NOT NULL, context TEXT NOT NULL,
   target TEXT);
-CREATE INDEX IF NOT EXISTS idx_refs_def_name ON code_refs_def(name);
+CREATE INDEX IF NOT EXISTS idx_refs_def_name ON code_refs_def(name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_refs_def_path ON code_refs_def(path);
-CREATE INDEX IF NOT EXISTS idx_refs_use_name ON code_refs_use(name);
+CREATE INDEX IF NOT EXISTS idx_refs_use_name ON code_refs_use(name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS idx_refs_use_path ON code_refs_use(path);
 CREATE VIRTUAL TABLE IF NOT EXISTS code_refs_fts USING fts5(
   name, context, content='code_refs_use', content_rowid='id');
@@ -75,6 +75,8 @@ const MIGRATIONS: &[&str] = &[
     // Reindex fidelity: the exact embedded string per symbol (NULL on
     // legacy DBs — reindex falls back to signature there).
     "ALTER TABLE symbols ADD COLUMN embed_text TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_refs_def_name_nocase ON code_refs_def(name COLLATE NOCASE)",
+    "CREATE INDEX IF NOT EXISTS idx_refs_use_name_nocase ON code_refs_use(name COLLATE NOCASE)",
 ];
 
 impl Store {
@@ -267,13 +269,29 @@ impl Store {
     /// total == df would otherwise silence the whole leg) while preserving
     /// the rare-over-common order at any scale. Returns 0.0 for names with
     /// no match anywhere.
-    pub fn refs_idf(&self, name: &str) -> Result<f64> {
-        let total: i64 = self.conn.query_row(
+    pub fn total_indexed_files(&self) -> Result<i64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM indexed_files",
+            [],
+            |r| r.get(0),
+        ).unwrap_or(0);
+        if n > 0 {
+            return Ok(n);
+        }
+        self.conn.query_row(
             "SELECT COUNT(*) FROM (SELECT DISTINCT path FROM code_refs_def
               UNION SELECT DISTINCT path FROM code_refs_use)",
             [],
             |r| r.get(0),
-        )?;
+        ).map_err(Into::into)
+    }
+
+    pub fn refs_idf(&self, name: &str) -> Result<f64> {
+        let total = self.total_indexed_files()?;
+        self.refs_idf_with_total(name, total)
+    }
+
+    pub fn refs_idf_with_total(&self, name: &str, total: i64) -> Result<f64> {
         if total <= 0 {
             return Ok(0.0);
         }
@@ -323,12 +341,11 @@ impl Store {
     /// entirely. A name in 1–2 files is a definition (+1 use site), never
     /// shared vocabulary, so require n >= 3 regardless of ratio.
     pub fn refs_name_is_generic_ratio(&self, name: &str, ratio: f64) -> Result<bool> {
-        let total: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM (SELECT DISTINCT path FROM code_refs_def
-              UNION SELECT DISTINCT path FROM code_refs_use)",
-            [],
-            |r| r.get(0),
-        )?;
+        let total = self.total_indexed_files()?;
+        self.refs_name_is_generic_ratio_with_total(name, ratio, total)
+    }
+
+    pub fn refs_name_is_generic_ratio_with_total(&self, name: &str, ratio: f64, total: i64) -> Result<bool> {
         if total <= 0 {
             return Ok(false);
         }
@@ -478,7 +495,7 @@ impl Store {
             n += self.conn.execute(
                 "UPDATE notes SET recall_count = CASE WHEN recall_count > 0 THEN recall_count - 1 ELSE 0 END WHERE id=?1",
                 params![id],
-            )? as usize;
+            )?;
         }
         Ok(n)
     }

@@ -11,8 +11,8 @@ use crate::agentic::{cortex_loop, generate, seed_memory, CortexRun, HarnessConfi
 use crate::corefile::CoreFile;
 use crate::embed::HashEmbedder;
 use crate::store::Store;
-use bench::bm25::Bm25Index;
-use bench::{count_tokens, tokenize};
+use cortex_core::bm25::Bm25Index;
+use cortex_core::{count_tokens, tokenize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -81,9 +81,9 @@ pub fn run_llm_harness(cfg: &LlmConfig) -> crate::Result<LlmHarnessReport> {
     if cfg.api_key.trim().is_empty() {
         return Err(crate::Error::Cli("OPENROUTER_API_KEY not set — dry-run only. Export it or run without --llm".into()));
     }
-    let mut base = cfg.base.clone();
-    if cfg.limit > 0 && (base.tasks as usize) > cfg.limit { base.tasks = cfg.limit; }
-    let project = generate(base.docs, base.tasks as usize, base.seed, base.distractors)?;
+    let mut base = cfg.base;
+    if cfg.limit > 0 && (base.tasks) > cfg.limit { base.tasks = cfg.limit; }
+    let project = generate(base.docs, base.tasks, base.seed, base.distractors)?;
     let store = Store::open_in_memory()?;
     // Harness convention: hash-64 for synthetic docs (no real semantics in
     // generated token soup; both arms share this store, so A/B stays fair).
@@ -109,7 +109,7 @@ pub fn run_llm_harness(cfg: &LlmConfig) -> crate::Result<LlmHarnessReport> {
         let mut success = false;
         let mut docs_read_texts: Vec<String> = Vec::new();
 
-        for turn in 0..base.max_turns as usize {
+        for turn in 0..base.max_turns {
             turns += 1;
             let ranking = index.ranking(&query);
             let mut spent = 0i64;
@@ -122,7 +122,7 @@ pub fn run_llm_harness(cfg: &LlmConfig) -> crate::Result<LlmHarnessReport> {
                 docs_read_texts.push(project.docs[di].text.chars().take(600).collect());
                 if project.docs[di].id == task.gold_doc { success = true; break; }
             }
-            if success || newly.is_empty() || turn + 1 == base.max_turns as usize { break; }
+            if success || newly.is_empty() || turn + 1 == base.max_turns { break; }
             // LLM picks next query from what was read
             match call_llm(&cfg.model, &cfg.api_key, &task.task, &docs_read_texts) {
                 Ok((q, tks)) => { query = q; llm_tokens_api += tks; llm_calls += 1; }
@@ -142,7 +142,7 @@ pub fn run_llm_harness(cfg: &LlmConfig) -> crate::Result<LlmHarnessReport> {
         let baseline_success = success;
 
         // Cortex arm unchanged (deterministic compile)
-        let c: CortexRun = cortex_loop(&store, &core, &emb, task, base.budget, base.max_turns as usize)?;
+        let c: CortexRun = cortex_loop(&store, &core, &emb, task, base.budget, base.max_turns)?;
         let reduction = if baseline_tokens > 0 { (baseline_tokens - c.tokens) as f64 / baseline_tokens as f64 } else { 0.0 };
         outcomes.push(TaskOutcome {
             id: task.id.clone(), baseline_tokens, cortex_tokens: c.tokens,
@@ -157,7 +157,7 @@ pub fn run_llm_harness(cfg: &LlmConfig) -> crate::Result<LlmHarnessReport> {
     // recompute paired stats from LLM baselines
     let reds: Vec<f64> = report.outcomes.iter().map(|o| o.reduction).collect();
     report.mean_reduction = crate::agentic::mean(&reds);
-    let (lo, hi) = bench::eval::bootstrap_ci(&reds, 10_000, 42);
+    let (lo, hi) = cortex_core::eval::bootstrap_ci(&reds, 10_000, 42);
     report.reduction_ci_lo = lo; report.reduction_ci_hi = hi;
     report.paired_t = crate::agentic::paired_t(&reds);
     report.cohens_d = crate::agentic::cohens_d(&reds);

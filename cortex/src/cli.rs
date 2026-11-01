@@ -176,7 +176,17 @@ enum EmbedCmd {
 }
 
 pub fn run(argv: Vec<String>) -> Result<()> {
-    let cli = Cli::try_parse_from(argv).map_err(|e| crate::Error::Cli(e.to_string()))?;
+    let cli = match Cli::try_parse_from(argv) {
+        Ok(c) => c,
+        Err(e) => {
+            if e.use_stderr() {
+                return Err(crate::Error::Cli(e.to_string()));
+            } else {
+                let _ = e.print();
+                return Ok(());
+            }
+        }
+    };
     match cli.cmd {
         Cmd::Init { path, embed, reconfigure, yes } => do_init(path, embed, reconfigure, yes),
         Cmd::Remember { content, kind, entity, link } => do_remember(content, kind, entity, link),
@@ -254,8 +264,15 @@ fn session_id() -> String {
 }
 
 fn is_tty() -> bool {
-    use std::io::IsTerminal;
-    std::io::stdout().is_terminal()
+    #[cfg(test)]
+    {
+        return false;
+    }
+    #[allow(unreachable_code)]
+    {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+    }
 }
 
 fn provider_dim(provider: &str) -> usize {
@@ -263,6 +280,7 @@ fn provider_dim(provider: &str) -> usize {
         "local-nomic" => 768,
         "ollama" => 768,
         "google" => 768,
+        "mistral" => 1024,
         "openai" => 3072,
         "hash" => 64,
         "noop" => 64,
@@ -276,6 +294,7 @@ fn provider_model(provider: &str) -> String {
         "ollama" => "nomic-embed-text".to_string(),
         "openai" => "text-embedding-3-large".to_string(),
         "google" => "text-embedding-004".to_string(),
+        "mistral" => "mistral-embed".to_string(),
         "hash" => "hash".to_string(),
         "noop" => "noop".to_string(),
         _ => provider.to_string(),
@@ -283,7 +302,7 @@ fn provider_model(provider: &str) -> String {
 }
 
 fn validate_provider(p: &str) -> Result<()> {
-    const KNOWN: &[&str] = &["local-nomic", "ollama", "openai", "google", "hash", "noop"];
+    const KNOWN: &[&str] = &["local-nomic", "ollama", "openai", "google", "mistral", "hash", "noop"];
     if KNOWN.contains(&p) {
         Ok(())
     } else {
@@ -296,10 +315,22 @@ fn download_nomic() -> Result<()> {
     if dir.join("model.onnx").exists() && dir.join("config.json").exists() {
         return Ok(());
     }
-    if dir.exists() && std::fs::read_dir(&dir).map(|mut d| d.next().is_some()).unwrap_or(false) && dir.join("model.onnx").exists() {
+    if dir.exists()
+        && std::fs::read_dir(&dir).map(|mut d| d.next().is_some()).unwrap_or(false)
+        && (dir.join("model.onnx").exists() || dir.join("model_optimized.onnx").exists())
+    {
         return Ok(());
     }
     std::fs::create_dir_all(&dir)?;
+    #[cfg(feature = "local-embed")]
+    {
+        let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::NomicEmbedTextV1)
+            .with_cache_dir(dir.clone())
+            .with_show_download_progress(true);
+        if fastembed::TextEmbedding::try_new(opts).is_ok() {
+            return Ok(());
+        }
+    }
     let dest = dir.join("model.onnx");
     let partial = dir.join("model.onnx.partial");
     let url = "https://huggingface.co/nomic-ai/nomic-embed-text-v1/resolve/main/model.onnx";
@@ -389,6 +420,7 @@ fn do_init(path: Option<String>, embed: Option<String>, reconfigure: bool, yes: 
         let options = vec![
             "Local nomic-embed-text (download ~110M, offline, 768d) [recommended]",
             "Ollama (use existing nomic-embed-text at http://localhost:11434)",
+            "Mistral (bring your own key, mistral-embed, 1024d)",
             "OpenAI (bring your own key, text-embedding-3-large)",
             "Google (bring your own key, text-embedding-004)",
             "Hash (offline, no semantics — only for CI/airgap, requires --yes)",
@@ -398,19 +430,25 @@ fn do_init(path: Option<String>, embed: Option<String>, reconfigure: bool, yes: 
         let provider = match idx {
             0 => "local-nomic",
             1 => "ollama",
-            2 => "openai",
-            3 => "google",
-            4 => "hash",
+            2 => "mistral",
+            3 => "openai",
+            4 => "google",
+            5 => "hash",
             _ => "local-nomic",
         };
         let mut api_env: Option<String> = None;
-        if provider == "openai" {
+        if provider == "mistral" {
+            let v = inquire::Text::new("env var for API key").with_default("MISTRAL_API_KEY").prompt().map_err(|e| crate::Error::Cli(e.to_string()))?;
+            if v.trim().is_empty() {
+                return Err(crate::Error::Cli("api key env var cannot be empty".into()));
+            }
+            api_env = Some(v);
+        } else if provider == "openai" {
             let v = inquire::Text::new("env var for API key").with_default("OPENAI_API_KEY").prompt().map_err(|e| crate::Error::Cli(e.to_string()))?;
             if v.trim().is_empty() {
                 return Err(crate::Error::Cli("api key env var cannot be empty".into()));
             }
             api_env = Some(v);
-            let _ = api_env;
         } else if provider == "google" {
             let v = inquire::Text::new("env var for API key").with_default("GOOGLE_API_KEY").prompt().map_err(|e| crate::Error::Cli(e.to_string()))?;
             if v.trim().is_empty() {
@@ -421,10 +459,11 @@ fn do_init(path: Option<String>, embed: Option<String>, reconfigure: bool, yes: 
         if provider == "hash" && !yes {
             return Err(crate::Error::Cli("hash provider requires --yes".into()));
         }
-        if provider == "openai" || provider == "google" {
+        if provider == "openai" || provider == "google" || provider == "mistral" {
             let dim = provider_dim(provider);
             let model = provider_model(provider);
             let default_env = match provider {
+                "mistral" => "MISTRAL_API_KEY",
                 "openai" => "OPENAI_API_KEY",
                 _ => "GOOGLE_API_KEY",
             };
@@ -454,6 +493,7 @@ fn do_init(path: Option<String>, embed: Option<String>, reconfigure: bool, yes: 
     let model = provider_model(&provider_choice);
     let (ollama_url, api_key_env) = match provider_choice.as_str() {
         "ollama" => (Some("http://localhost:11434".to_string()), None),
+        "mistral" => (None, Some("MISTRAL_API_KEY".to_string())),
         "openai" => (None, Some("OPENAI_API_KEY".to_string())),
         "google" => (None, Some("GOOGLE_API_KEY".to_string())),
         _ => (None, None),
@@ -490,12 +530,23 @@ fn do_embeddings_list() -> Result<()> {
     let base = current_base();
     let cfg_path = config_path(&base);
     let cfg = std::fs::read_to_string(&cfg_path).ok().and_then(|s| toml::from_str::<EmbeddingConfig>(&s).ok()).unwrap_or_default();
-    let providers = ["local-nomic", "ollama", "openai", "google", "hash", "noop"];
+    let providers = ["local-nomic", "ollama", "openai", "google", "mistral", "hash", "noop"];
     println!("providers:");
     for p in providers {
         let active = if cfg.provider == p { "*" } else { " " };
         let dim = if cfg.provider == p { cfg.dim } else { provider_dim(p) };
-        let tmp_cfg = EmbeddingConfig { provider: p.to_string(), dim, model: provider_model(p), ollama_url: if p == "ollama" { Some("http://localhost:11434".to_string()) } else { None }, api_key_env: match p { "openai" => Some("OPENAI_API_KEY".to_string()), "google" => Some("GOOGLE_API_KEY".to_string()), _ => None } };
+        let tmp_cfg = EmbeddingConfig {
+            provider: p.to_string(),
+            dim,
+            model: provider_model(p),
+            ollama_url: if p == "ollama" { Some("http://localhost:11434".to_string()) } else { None },
+            api_key_env: match p {
+                "mistral" => Some("MISTRAL_API_KEY".to_string()),
+                "openai" => Some("OPENAI_API_KEY".to_string()),
+                "google" => Some("GOOGLE_API_KEY".to_string()),
+                _ => None,
+            },
+        };
         let status = match crate::embed::registry::from_config(&tmp_cfg) {
             Ok(prov) => match prov.health_check() { Ok(()) => "ok", Err(_) => "missing" },
             Err(_) => "unknown",
@@ -551,6 +602,7 @@ fn do_embeddings_use(provider: String, model: Option<String>, ollama_url: Option
         cfg.api_key_env = Some(e);
     } else {
         cfg.api_key_env = match provider.as_str() {
+            "mistral" => Some("MISTRAL_API_KEY".to_string()),
             "openai" => Some("OPENAI_API_KEY".to_string()),
             "google" => Some("GOOGLE_API_KEY".to_string()),
             _ => None,
@@ -899,7 +951,7 @@ fn do_map(query: String, json: bool) -> Result<()> {
     let mut out_text = String::new();
     for l in &lines {
         let cand = if out_text.is_empty() { l.clone() } else { format!("{out_text}\n{l}") };
-        if bench::count_tokens(&cand) > 1000 {
+        if cortex_core::count_tokens(&cand) > 1000 {
             break;
         }
         out_text = cand;
@@ -1257,7 +1309,7 @@ fn parse_import_generic(t: &str, lang: &str) -> Option<(String, String, Option<S
                 .split_whitespace()
                 .next()
                 .unwrap_or("")
-                .trim_end_matches(|c| c == ';' || c == '{' || c == ',');
+                .trim_end_matches([';', '{', ',']);
             if path.is_empty() {
                 return None;
             }
@@ -1415,7 +1467,7 @@ fn top_segment(name: &str) -> Option<String> {
         }
         format!("{first}/{second}")
     } else {
-        name.split(|c| c == '.' || c == ':' || c == '/')
+        name.split(['.', ':', '/'])
             .next()
             .unwrap_or("")
             .to_string()
@@ -1667,7 +1719,7 @@ fn extract_symbols(root: &Path, excludes: &[String]) -> (Vec<SymbolRow>, RefInde
                     Err(_) => continue,
                 };
                 if ext_lc == ".py" {
-                    let file_syms = bench::symbols::extract_file_symbols(&rel, &text);
+                    let file_syms = cortex_core::symbols::extract_file_symbols(&rel, &text);
                     let file_defs: Vec<(String, String, i64, i64, String)> = file_syms
                         .iter()
                         .map(|s| {
@@ -1681,7 +1733,7 @@ fn extract_symbols(root: &Path, excludes: &[String]) -> (Vec<SymbolRow>, RefInde
                         out.push((s.path.clone(), s.name.clone(), s.kind.clone(), s.line_start as i64, s.line_end as i64, sig, embed_text));
                     }
                     let file_uses: Vec<(String, String, i64, String, Option<String>)> =
-                        bench::symbols::extract_file_refs(&rel, &text)
+                        cortex_core::symbols::extract_file_refs(&rel, &text)
                             .into_iter()
                             .map(|r| (r.name, r.kind, r.line as i64, r.context, r.target))
                             .collect();
@@ -1754,6 +1806,7 @@ fn do_index(path: String, embed: String, excludes: Vec<String>) -> Result<()> {
         let model = provider_model(&embed);
         let (ollama_url, api_key_env) = match embed.as_str() {
             "ollama" => (Some("http://localhost:11434".to_string()), None),
+            "mistral" => (None, Some("MISTRAL_API_KEY".to_string())),
             "openai" => (None, Some("OPENAI_API_KEY".to_string())),
             "google" => (None, Some("GOOGLE_API_KEY".to_string())),
             _ => (None, None),
@@ -1808,12 +1861,14 @@ fn do_index(path: String, embed: String, excludes: Vec<String>) -> Result<()> {
     if root.is_dir() {
         store.conn.execute("DELETE FROM symbols", [])?;
     }
+    store.conn.execute_batch("BEGIN TRANSACTION;")?;
     for (rel, name, kind, ls, le, sig, embed_text) in &symbols {
         store.conn.execute(
             "INSERT INTO symbols(path,name,kind,line_start,line_end,signature,embed_text) VALUES(?1,?2,?3,?4,?5,?6,?7)",
             rusqlite::params![rel, name, kind, ls, le, sig, embed_text],
         )?;
     }
+    store.conn.execute_batch("COMMIT;")?;
     // Phase 2: drain the reference side-map into code_refs_* (no
     // embeddings involved — pure tree-sitter + SQLite).
     let mut ref_files = 0usize;
@@ -1833,7 +1888,7 @@ fn do_index(path: String, embed: String, excludes: Vec<String>) -> Result<()> {
     if root.is_dir() {
         let _ = store.set_meta(
             "index_root",
-            &root.to_string_lossy().to_string(),
+            root.to_string_lossy().as_ref(),
         );
     }
     {
@@ -1869,6 +1924,7 @@ fn do_index(path: String, embed: String, excludes: Vec<String>) -> Result<()> {
         let sigs: Vec<String> = symbols.iter().map(|(_, _, _, _, _, _, embed_text)| embed_text.clone()).collect();
         let (vecs, failed) = embed_best_effort(provider.as_ref(), sigs);
         let mut n_embedded = 0usize;
+        store.conn.execute_batch("BEGIN TRANSACTION;")?;
         for ((rel, name, _, ls, _, _, _), vec) in symbols.iter().zip(vecs.iter()) {
             if let Some(v) = vec {
                 let blob = crate::store::serialize_f32s(v);
@@ -1879,6 +1935,7 @@ fn do_index(path: String, embed: String, excludes: Vec<String>) -> Result<()> {
                 n_embedded += 1;
             }
         }
+        store.conn.execute_batch("COMMIT;")?;
         if failed > 0 {
             eprintln!("warning: {failed} symbol embeddings failed (NULL blob, FTS-only for those)");
         }
@@ -1900,6 +1957,7 @@ fn do_reindex(embed: Option<String>) -> Result<()> {
         let model = provider_model(&e);
         let (ollama_url, api_key_env) = match e.as_str() {
             "ollama" => (Some("http://localhost:11434".to_string()), None),
+            "mistral" => (None, Some("MISTRAL_API_KEY".to_string())),
             "openai" => (None, Some("OPENAI_API_KEY".to_string())),
             "google" => (None, Some("GOOGLE_API_KEY".to_string())),
             _ => (None, None),
@@ -1923,7 +1981,7 @@ fn do_reindex(embed: Option<String>) -> Result<()> {
         // Reindex fidelity: re-embed the exact indexed string; legacy rows
         // with NULL embed_text fall back to signature (short text — the next
         // full `index` backfills them).
-        let mut st = store.conn.prepare("SELECT id, COALESCE(embed_text, signature) FROM symbols")?;
+        let mut st = store.conn.prepare("SELECT id, COALESCE(embed_text, signature, name) FROM symbols")?;
         let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
         for r in rows { sym_rows.push(r?); }
     }
@@ -1931,6 +1989,7 @@ fn do_reindex(embed: Option<String>) -> Result<()> {
     if !note_rows.is_empty() {
         let texts: Vec<String> = note_rows.iter().map(|(_, c)| c.clone()).collect();
         let (vecs, failed) = embed_best_effort(provider.as_ref(), texts);
+        store.conn.execute_batch("BEGIN TRANSACTION;")?;
         for ((id, _), vec) in note_rows.iter().zip(vecs.iter()) {
             if let Some(v) = vec {
                 let blob = crate::store::serialize_f32s(v);
@@ -1938,6 +1997,7 @@ fn do_reindex(embed: Option<String>) -> Result<()> {
                 n_notes += 1;
             }
         }
+        store.conn.execute_batch("COMMIT;")?;
         if failed > 0 {
             eprintln!("warning: {failed} note embeddings failed (NULL blob, FTS-only for those)");
         }
@@ -1946,6 +2006,7 @@ fn do_reindex(embed: Option<String>) -> Result<()> {
     if !sym_rows.is_empty() {
         let texts: Vec<String> = sym_rows.iter().map(|(_, s)| s.clone()).collect();
         let (vecs, failed) = embed_best_effort(provider.as_ref(), texts);
+        store.conn.execute_batch("BEGIN TRANSACTION;")?;
         for ((id, _), vec) in sym_rows.iter().zip(vecs.iter()) {
             if let Some(v) = vec {
                 let blob = crate::store::serialize_f32s(v);
@@ -1953,6 +2014,7 @@ fn do_reindex(embed: Option<String>) -> Result<()> {
                 n_syms += 1;
             }
         }
+        store.conn.execute_batch("COMMIT;")?;
         if failed > 0 {
             eprintln!("warning: {failed} symbol embeddings failed (NULL blob, FTS-only for those)");
         }

@@ -18,8 +18,7 @@ impl Isotonic {
         let mut order: Vec<usize> = (0..scores.len()).collect();
         order.sort_by(|&a, &b| {
             scores[a]
-                .partial_cmp(&scores[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&scores[b])
         });
         let mut blocks: Vec<Block> = Vec::with_capacity(scores.len());
         for &i in &order {
@@ -127,7 +126,7 @@ pub fn bootstrap_rho_ci(
         let iso = Isotonic::fit(&s, &y);
         rhos.push(mean_rho(&iso, ctx_scores, ctx_costs));
     }
-    rhos.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    rhos.sort_by(|a, b| a.total_cmp(b));
     let lo_i = ((iters as f64 * 0.025) as usize).min(iters - 1);
     let hi_i = ((iters as f64 * 0.975) as usize).min(iters - 1);
     (point, rhos[lo_i], rhos[hi_i])

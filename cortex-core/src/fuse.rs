@@ -25,8 +25,7 @@ pub fn rank_order(scores: &[f64]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..scores.len()).collect();
     idx.sort_by(|&a, &b| {
         scores[b]
-            .partial_cmp(&scores[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&scores[a])
     });
     idx
 }
@@ -90,8 +89,7 @@ pub fn positive_rank_order(scores: &[f64]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..scores.len()).filter(|&i| scores[i] > 0.0).collect();
     idx.sort_by(|&a, &b| {
         scores[b]
-            .partial_cmp(&scores[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
+            .total_cmp(&scores[a])
             .then_with(|| a.cmp(&b))
     });
     idx

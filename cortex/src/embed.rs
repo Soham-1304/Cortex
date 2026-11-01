@@ -35,14 +35,14 @@ impl EmbeddingProvider for HashEmbedder {
             .iter()
             .map(|t| {
                 let mut v = vec![0f32; self.dim];
-                if t.trim().is_empty() {
+                if self.dim == 0 || t.trim().is_empty() {
                     return v;
                 }
-                for tok in t
-                    .to_lowercase()
-                    .split(|c: char| !c.is_alphanumeric())
-                    .filter(|s| !s.is_empty())
-                {
+                let mut prev_h: Option<u64> = None;
+                cortex_core::visit_tokens(t, |tok| {
+                    if tok.is_empty() {
+                        return;
+                    }
                     let mut h: u64 = 0xcbf29ce484222325;
                     for b in tok.bytes() {
                         h ^= b as u64;
@@ -50,7 +50,17 @@ impl EmbeddingProvider for HashEmbedder {
                     }
                     v[(h as usize) % self.dim] += 1.0;
                     v[((h >> 32) as usize) % self.dim] -= 1.0;
-                }
+                    // In higher-dimensional hash spaces (>=256d), also project adjacent
+                    // token bigrams so phrase order ("url validator" <-> "URLValidator") aligns.
+                    if self.dim >= 256 {
+                        if let Some(ph) = prev_h {
+                            let bh = ph.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ h;
+                            v[(bh as usize) % self.dim] += 0.5;
+                            v[((bh >> 32) as usize) % self.dim] -= 0.5;
+                        }
+                    }
+                    prev_h = Some(h);
+                });
                 let n: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-9);
                 if n < 1e-6 {
                     return v;
@@ -145,6 +155,8 @@ impl EmbeddingProvider for OllamaProvider {
 pub struct LocalNomicEmbedder {
     pub dim: usize,
     pub model_dir: std::path::PathBuf,
+    #[cfg(feature = "local-embed")]
+    session: std::sync::Mutex<Option<fastembed::TextEmbedding>>,
 }
 impl LocalNomicEmbedder {
     pub fn new(cfg: &crate::config::EmbeddingConfig) -> Result<Self> {
@@ -152,6 +164,8 @@ impl LocalNomicEmbedder {
         Ok(Self {
             dim: cfg.dim,
             model_dir: dir,
+            #[cfg(feature = "local-embed")]
+            session: std::sync::Mutex::new(None),
         })
     }
 }
@@ -168,21 +182,33 @@ impl EmbeddingProvider for LocalNomicEmbedder {
     fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         #[cfg(feature = "local-embed")]
         {
+            if texts.is_empty() {
+                return Ok(Vec::new());
+            }
             if !self.model_dir.exists()
                 || std::fs::read_dir(&self.model_dir)
                     .map(|mut d| d.next().is_none())
                     .unwrap_or(true)
             {
                 return Err(crate::Error::Cli(format!(
-                    "model not found at {} — run cortex embeddings install",
+                    "model not found at {} — run cortex embeddings install local-nomic",
                     self.model_dir.display()
                 )));
             }
-            let opts = fastembed::InitOptions::new(fastembed::EmbeddingModel::NomicEmbedTextV1)
-                .with_cache_dir(self.model_dir.clone())
-                .with_show_download_progress(false);
-            let model = fastembed::TextEmbedding::try_new(opts)
-                .map_err(|e| crate::Error::Cli(e.to_string()))?;
+            let mut guard = self
+                .session
+                .lock()
+                .map_err(|_| crate::Error::Cli("local-nomic session mutex poisoned".into()))?;
+            if guard.is_none() {
+                let opts =
+                    fastembed::InitOptions::new(fastembed::EmbeddingModel::NomicEmbedTextV1)
+                        .with_cache_dir(self.model_dir.clone())
+                        .with_show_download_progress(false);
+                let model = fastembed::TextEmbedding::try_new(opts)
+                    .map_err(|e| crate::Error::Cli(e.to_string()))?;
+                *guard = Some(model);
+            }
+            let model = guard.as_ref().unwrap();
             let embs = model
                 .embed(texts, None)
                 .map_err(|e| crate::Error::Cli(e.to_string()))?;
@@ -353,11 +379,88 @@ impl EmbeddingProvider for GoogleProvider {
         }
     }
 }
+pub struct MistralProvider {
+    pub dim: usize,
+    pub model: String,
+    pub api_key_env: String,
+}
+impl MistralProvider {
+    pub fn new(cfg: &crate::config::EmbeddingConfig) -> Result<Self> {
+        let model = if cfg.model.trim().is_empty() || cfg.model == "mistral" {
+            "mistral-embed".to_string()
+        } else {
+            cfg.model.clone()
+        };
+        Ok(Self {
+            dim: cfg.dim,
+            model,
+            api_key_env: cfg
+                .api_key_env
+                .clone()
+                .unwrap_or_else(|| "MISTRAL_API_KEY".into()),
+        })
+    }
+}
+impl EmbeddingProvider for MistralProvider {
+    fn name(&self) -> &str {
+        "mistral"
+    }
+    fn dim(&self) -> usize {
+        self.dim
+    }
+    fn is_local(&self) -> bool {
+        false
+    }
+    fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let key = std::env::var(&self.api_key_env)
+            .map_err(|_| crate::Error::Cli(format!("env {} not set", self.api_key_env)))?;
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_secs(30))
+            .build();
+        let body = serde_json::json!({"model": &self.model, "input": texts});
+        let resp: serde_json::Value = agent
+            .post("https://api.mistral.ai/v1/embeddings")
+            .set("Authorization", &format!("Bearer {key}"))
+            .send_json(body)
+            .map_err(|e| crate::Error::Http(e.to_string()))?
+            .into_json()
+            .map_err(|e| crate::Error::Http(e.to_string()))?;
+        let data = resp["data"]
+            .as_array()
+            .ok_or_else(|| serde_json::Error::custom("no data field"))?;
+        let mut out = Vec::with_capacity(data.len());
+        for item in data {
+            let arr = item["embedding"]
+                .as_array()
+                .ok_or_else(|| serde_json::Error::custom("no embedding"))?;
+            out.push(
+                arr.iter()
+                    .filter_map(|x| x.as_f64())
+                    .map(|x| x as f32)
+                    .collect(),
+            );
+        }
+        Ok(out)
+    }
+    fn health_check(&self) -> Result<()> {
+        if std::env::var(&self.api_key_env).is_ok() {
+            Ok(())
+        } else {
+            Err(crate::Error::Cli(format!(
+                "env {} not set",
+                self.api_key_env
+            )))
+        }
+    }
+}
 pub mod registry {
     use crate::config::EmbeddingConfig;
     use crate::embed::{
-        EmbeddingProvider, GoogleProvider, HashEmbedder, LocalNomicEmbedder, NoOpEmbedder,
-        OllamaProvider, OpenAIProvider,
+        EmbeddingProvider, GoogleProvider, HashEmbedder, LocalNomicEmbedder, MistralProvider,
+        NoOpEmbedder, OllamaProvider, OpenAIProvider,
     };
     use crate::Result;
     pub fn from_config(cfg: &EmbeddingConfig) -> Result<Box<dyn EmbeddingProvider>> {
@@ -375,6 +478,7 @@ pub mod registry {
             "local-nomic" => Ok(Box::new(LocalNomicEmbedder::new(cfg)?)),
             "openai" => Ok(Box::new(OpenAIProvider::new(cfg)?)),
             "google" => Ok(Box::new(GoogleProvider::new(cfg)?)),
+            "mistral" => Ok(Box::new(MistralProvider::new(cfg)?)),
             other => Err(crate::Error::Cli(format!("unknown provider {other}"))),
         }
     }

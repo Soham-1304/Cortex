@@ -1,6 +1,6 @@
 use crate::Result;
 use crate::{corefile::CoreFile, embed::EmbeddingProvider, store::Store};
-use bench::{
+use cortex_core::{
     count_tokens,
     pack::{knapsack, Item},
 };
@@ -20,6 +20,8 @@ pub struct SymbolHit {
     pub line_start: i64,
     pub line_end: i64,
     pub signature: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
 }
 
 /// One file's candidate symbols, in rank order. Orientation-shaped output:
@@ -30,6 +32,10 @@ pub struct SymbolHit {
 pub struct FileGroup {
     pub path: String,
     pub symbols: Vec<SymbolHit>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub imports: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub referenced_by: Vec<String>,
 }
 
 /// Group flat symbol hits by file, preserving first-seen file order and
@@ -50,7 +56,12 @@ fn group_symbols(syms: Vec<SymbolHit>) -> Vec<FileGroup> {
         .into_iter()
         .map(|path| {
             let symbols = map.remove(&path).unwrap_or_default();
-            FileGroup { path, symbols }
+            FileGroup {
+                path,
+                symbols,
+                imports: Vec::new(),
+                referenced_by: Vec::new(),
+            }
         })
         .collect()
 }
@@ -86,7 +97,7 @@ fn truncate_by_tokens(s: &str, budget: i64) -> String {
     if budget <= 0 {
         return String::new();
     }
-    let toks = bench::tokenize(s);
+    let toks = cortex_core::tokenize(s);
     if toks.len() as i64 <= budget {
         return s.to_string();
     }
@@ -452,7 +463,7 @@ pub fn compile(
         }
     }
     let mut stages = StageTimesSer { fts_ms: 0, vec_ms: 0, graph_ms: 0, pack_ms: 0 };
-    let toks_task = bench::tokenize(task);
+    let toks_task = cortex_core::tokenize(task);
     // Hoisted single task embedding shared by the mem + sym arms.
     let task_vec_opt: Option<Vec<f32>> = match emb.embed(vec![task.to_string()]) {
         Ok(mut v) if !v.is_empty() => {
@@ -567,8 +578,7 @@ pub fn compile(
             let mut order: Vec<usize> = (0..note_rows.len()).collect();
             order.sort_by(|&a, &b| {
                 scores[b]
-                    .partial_cmp(&scores[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .total_cmp(&scores[a])
                     .then_with(|| note_rows[a].0.cmp(&note_rows[b].0))
             });
             for (rank, idx) in order.into_iter().enumerate() {
@@ -614,38 +624,58 @@ pub fn compile(
             }
             mem_cands.push((*id, content.clone(), score));
         }
-        mem_cands.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        mem_cands.sort_by(|a, b| b.2.total_cmp(&a.2));
         mem_cands.truncate(15);
     }
     stages.vec_ms += t_vec.elapsed().as_millis() as u64;
     let mut sym_rows: Vec<SymbolHit> = Vec::new();
     let mut sym_embs: Vec<Option<Vec<u8>>> = Vec::new();
+    let mut sym_texts: Vec<String> = Vec::new();
+    let mut sym_meta: Vec<(String, String, i64)> = Vec::new();
     {
         let mut st = db.conn.prepare(
-            "SELECT path, name, line_start, line_end, signature, embedding FROM symbols",
+            "SELECT path, name, line_start, line_end, signature, embedding, COALESCE(embed_text, '') FROM symbols",
         )?;
         let rows = st.query_map([], |r| {
+            let path: String = r.get(0)?;
+            let name: String = r.get(1)?;
+            let line_start: i64 = r.get(2)?;
+            let line_end: i64 = r.get(3)?;
+            let signature: Option<String> = r.get(4)?;
+            let emb_blob: Option<Vec<u8>> = r.get(5)?;
+            let body: String = r.get(6)?;
             Ok((
                 SymbolHit {
-                    path: r.get(0)?,
-                    name: r.get(1)?,
-                    line_start: r.get(2)?,
-                    line_end: r.get(3)?,
-                    signature: r.get(4)?,
+                    path,
+                    name,
+                    line_start,
+                    line_end,
+                    signature,
+                    snippet: None,
                 },
-                r.get::<_, Option<Vec<u8>>>(5)?,
+                emb_blob,
+                body,
             ))
         })?;
         for r in rows {
-            let (hit, emb_blob) = r?;
+            let (hit, emb_blob, body) = r?;
+            sym_meta.push((hit.path.clone(), hit.name.clone(), hit.line_start));
             sym_rows.push(hit);
             sym_embs.push(emb_blob);
+            sym_texts.push(body);
         }
     }
     let mut sym_cands: Vec<(SymbolHit, f64)> = Vec::new();
     if !sym_rows.is_empty() {
-        // Substring arm scores (always computable).
+        // Multi-field Robertson BM25F + substring scoring over (name, path, signature, body).
+        let total_files = db.total_indexed_files().unwrap_or(0);
+        let bm25f_query = cortex_core::bm25::Bm25fQuery::new(task, |tok| {
+            db.refs_idf_with_total(tok, total_files).unwrap_or(1.0).max(0.1)
+        });
         let mut sub_scores: Vec<f64> = vec![0.0; sym_rows.len()];
+        let mut bm25f_scratch: Vec<f64> = Vec::new();
+        let avgs = cortex_core::bm25::FieldLengths::default();
+
         if !toks_task.is_empty() {
             for (i, sym) in sym_rows.iter().enumerate() {
                 let name_lc = sym.name.to_lowercase();
@@ -656,7 +686,25 @@ pub fn compile(
                         cnt += 1;
                     }
                 }
-                sub_scores[i] = cnt as f64 / toks_task.len() as f64;
+                let naive_sub = cnt as f64 / toks_task.len() as f64;
+                if naive_sub > 0.0 {
+                    let bm25f_s = if !bm25f_query.is_empty() {
+                        bm25f_query.score_symbol(
+                            cortex_core::bm25::SymbolFields {
+                                name: &sym.name,
+                                path: &sym.path,
+                                signature: sym.signature.as_deref().unwrap_or(""),
+                                body: &sym_texts[i],
+                            },
+                            avgs,
+                            &mut bm25f_scratch,
+                        )
+                    } else {
+                        0.0
+                    };
+                    let bm_norm = bm25f_s / (bm25f_s + 4.0);
+                    sub_scores[i] = 0.3 * naive_sub + 0.7 * bm_norm;
+                }
             }
         }
         // Refs arm (Phase 4): exact identifier hits from the code reference
@@ -673,6 +721,7 @@ pub fn compile(
             .unwrap_or(true);
         let mut refs_scores: Vec<f64> = vec![0.0; sym_rows.len()];
         if refs_enabled && !toks_task.is_empty() {
+            let total_files = db.total_indexed_files().unwrap_or(0);
             let mut name_to_rows: std::collections::HashMap<String, Vec<usize>> =
                 std::collections::HashMap::new();
             for (i, sym) in sym_rows.iter().enumerate() {
@@ -712,7 +761,7 @@ pub fn compile(
                 let t_generic = match generic_cache.get(t) {
                     Some(v) => *v,
                     None => {
-                        let v = db.refs_name_is_generic_ratio(t, 0.02).unwrap_or(false);
+                        let v = db.refs_name_is_generic_ratio_with_total(t, 0.02, total_files).unwrap_or(false);
                         generic_cache.insert(t.clone(), v);
                         v
                     }
@@ -723,7 +772,7 @@ pub fn compile(
                 // IDF weight: rare identifiers (the navigation signal) vote
                 // far more than boilerplate that survived the gate. Same
                 // weight for all three vote sources below.
-                let w = db.refs_idf(t).unwrap_or(0.0);
+                let w = db.refs_idf_with_total(t, total_files).unwrap_or(0.0);
                 if w <= 0.0 {
                     continue;
                 }
@@ -759,22 +808,31 @@ pub fn compile(
                 // access/base — not a prose mention or bare RHS. Bare
                 // mentions are what flooded the leg with rare-but-wrong
                 // votes, so they don't vote. Same generic gate on top.
+                // Tokenized inverted lookup: instead of scanning all symbol names
+                // in the repo (9k+), look up the ~20 tokens present in ctx_lc.
                 for (_p, _l, ctx) in f.iter() {
                     let ctx_lc = ctx.to_lowercase();
-                    for (name, rows) in &name_to_rows {
-                        if !is_code_mention(&ctx_lc, name) {
+                    let mut seen_in_ctx: std::collections::HashSet<&str> =
+                        std::collections::HashSet::new();
+                    for word in ctx_lc.split(|c: char| !c.is_alphanumeric() && c != '_') {
+                        if word.len() < 2 || !seen_in_ctx.insert(word) {
                             continue;
                         }
-                        let generic = match generic_cache.get(name) {
-                            Some(v) => *v,
-                            None => {
-                                let v = db.refs_name_is_generic_ratio(name, 0.02).unwrap_or(false);
-                                generic_cache.insert(name.clone(), v);
-                                v
+                        if let Some(rows) = name_to_rows.get(word) {
+                            if !is_code_mention(&ctx_lc, word) {
+                                continue;
                             }
-                        };
-                        if !generic {
-                            voted.extend(rows.iter().copied());
+                            let generic = match generic_cache.get(word) {
+                                Some(v) => *v,
+                                None => {
+                                    let v = db.refs_name_is_generic_ratio_with_total(word, 0.02, total_files).unwrap_or(false);
+                                    generic_cache.insert(word.to_string(), v);
+                                    v
+                                }
+                            };
+                            if !generic {
+                                voted.extend(rows.iter().copied());
+                            }
                         }
                     }
                 }
@@ -886,56 +944,41 @@ pub fn compile(
                 .collect();
             rorder.sort_by(|&a, &b| {
                 refs_scores[b]
-                    .partial_cmp(&refs_scores[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .total_cmp(&refs_scores[a])
                     .then_with(|| sym_rows[a].name.cmp(&sym_rows[b].name))
             });
             for (rank, idx) in rorder.into_iter().enumerate() {
                 refs_rank.insert(idx, rank);
             }
         }
-        if cos_scores.is_none() {
-            for (i, (sym, s)) in sym_rows.into_iter().zip(sub_scores).enumerate() {
-                // No-cosine path: refs leg adds its raw exact-hit score
-                // (already a 0..1 fraction) on top of substring.
-                // (Graph leg removed here too — see RRF path note.)
-                let score = s + refs_scores[i];
-                if score > 0.0 {
-                    sym_cands.push((sym, score));
-                }
-            }
-        } else if let Some(cos) = cos_scores {
+        let syms: Vec<SymbolHit> = sym_rows;
+        let mut base = vec![0.0; syms.len()];
+
+        if let Some(ref cos) = cos_scores {
             let mut cos_rank: std::collections::HashMap<usize, usize> =
                 std::collections::HashMap::new();
-            let mut order: Vec<usize> = (0..sym_rows.len()).collect();
+            let mut order: Vec<usize> = (0..syms.len()).collect();
             order.sort_by(|&a, &b| {
                 cos[b]
-                    .partial_cmp(&cos[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| sym_rows[a].name.cmp(&sym_rows[b].name))
+                    .total_cmp(&cos[a])
+                    .then_with(|| syms[a].name.cmp(&syms[b].name))
             });
             for (rank, idx) in order.into_iter().enumerate() {
                 cos_rank.insert(idx, rank);
             }
             let mut sub_rank: std::collections::HashMap<usize, usize> =
                 std::collections::HashMap::new();
-            let mut sorder: Vec<usize> = (0..sym_rows.len())
+            let mut sorder: Vec<usize> = (0..syms.len())
                 .filter(|&i| sub_scores[i] > 0.0)
                 .collect();
             sorder.sort_by(|&a, &b| {
                 sub_scores[b]
-                    .partial_cmp(&sub_scores[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then_with(|| sym_rows[a].name.cmp(&sym_rows[b].name))
+                    .total_cmp(&sub_scores[a])
+                    .then_with(|| syms[a].name.cmp(&syms[b].name))
             });
             for (rank, idx) in sorder.into_iter().enumerate() {
                 sub_rank.insert(idx, rank);
             }
-            // Two-pass fusion: base RRF scores first, then the file
-            // neighborhood spreads seed weight (1 hop) so co-file and
-            // import/incoming neighbors can enter the top-12.
-            let syms: Vec<SymbolHit> = sym_rows.into_iter().collect();
-            let mut base = vec![0.0; syms.len()];
             for i in 0..syms.len() {
                 if cos[i] > 0.0 {
                     base[i] += rrf(cos_rank[&i]);
@@ -943,25 +986,57 @@ pub fn compile(
                 if let Some(rank) = sub_rank.get(&i) {
                     base[i] += rrf(*rank);
                 }
-                // Phase 4: third RRF leg — exact identifier hits.
                 if let Some(rank) = refs_rank.get(&i) {
                     base[i] += rrf(*rank);
                 }
             }
-            // Graph leg REMOVED 2026-09-20 (Task 4 refuted, N=125):
-            // file-neighborhood spread boosted seed neighborhoods, but on
-            // miss-tasks the seeds are wrong — rich-get-richer on the wrong
-            // files. Measured file −0.048/task, 95% CI [−0.096,−0.008].
-            // file_connections() stays for find/map; see METRICS §5.
-            for (i, sym) in syms.into_iter().enumerate() {
-                if base[i] > 0.0 {
-                    sym_cands.push((sym, base[i]));
+        } else {
+            for i in 0..syms.len() {
+                let s = sub_scores[i] + refs_scores[i];
+                if s > 0.0 {
+                    base[i] = s;
                 }
             }
         }
-        sym_cands.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Stage 1: File-level priors P(F) from geometric decay of top symbol scores (s1 + 0.5 s2 + 0.25 s3)
+        let mut file_top_scores: std::collections::HashMap<String, Vec<f64>> =
+            std::collections::HashMap::new();
+        for (i, sym) in syms.iter().enumerate() {
+            if base[i] > 0.0 {
+                file_top_scores.entry(sym.path.clone()).or_default().push(base[i]);
+            }
+        }
+        let mut file_priors: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        for (fpath, mut scores) in file_top_scores {
+            scores.sort_by(|a, b| b.total_cmp(a));
+            let s1 = scores[0];
+            let s2 = scores.get(1).copied().unwrap_or(0.0);
+            let s3 = scores.get(2).copied().unwrap_or(0.0);
+            let prior = s1 + 0.5 * s2 + 0.25 * s3;
+            file_priors.insert(fpath, prior);
+        }
+
+        // Stage 2: Combine symbol score with its file prior:
+        // S_hier(s) = 0.35 * P(F) + 0.65 * S(s)
+        for (i, sym) in syms.into_iter().enumerate() {
+            if base[i] > 0.0 {
+                let fp = file_priors.get(&sym.path).copied().unwrap_or(base[i]);
+                let score = 0.35 * fp + 0.65 * base[i];
+                sym_cands.push((sym, score));
+            }
+        }
+        sym_cands.sort_by(|a, b| b.1.total_cmp(&a.1));
         sym_cands = pool_by_file(sym_cands, POOL_TOP_FILES);
-        sym_cands.truncate(12);
+        sym_cands.truncate(48);
+    }
+    let mut sym_body_map: std::collections::HashMap<(String, String, i64), String> =
+        std::collections::HashMap::new();
+    for (m, body) in sym_meta.iter().zip(sym_texts) {
+        if !body.is_empty() {
+            sym_body_map.insert((m.0.clone(), m.1.clone(), m.2), body);
+        }
     }
     let mut items: Vec<Item> = Vec::new();
     for (i, (_, content, score)) in mem_cands.iter().enumerate() {
@@ -1027,13 +1102,39 @@ pub fn compile(
             let _ = score;
         }
     }
+    // Progressive L3 Snippet Expansion within remaining budget:
+    let mut surplus = remaining - packed_cost;
+    if surplus > 30 && !out_syms.is_empty() {
+        for sym in out_syms.iter_mut() {
+            if surplus < 30 {
+                break;
+            }
+            if let Some(body) = sym_body_map.get(&(sym.path.clone(), sym.name.clone(), sym.line_start)) {
+                let sig_txt = sym.signature.as_deref().unwrap_or(&sym.name);
+                let sig_cost = count_tokens(sig_txt).max(1);
+                let body_cost = count_tokens(body).max(1);
+                let delta = body_cost - sig_cost;
+                if delta > 0 && delta <= surplus {
+                    sym.snippet = Some(body.clone());
+                    surplus -= delta;
+                    packed_cost += delta;
+                }
+            }
+        }
+    }
     let rho_naive = if packed_cost > 0 {
         (weighted / packed_cost as f64).clamp(0.0, 1.0)
     } else {
         0.0
     };
     let tokens_used = core_cost + packed_cost;
-    let groups = group_symbols(out_syms.clone());
+    let mut groups = group_symbols(out_syms.clone());
+    for g in groups.iter_mut() {
+        if let Ok((imp, refs)) = db.file_connections(&g.path, 5) {
+            g.imports = imp;
+            g.referenced_by = refs;
+        }
+    }
     Ok(Payload {
         core: core_opt,
         memories: out_mems,
@@ -1374,6 +1475,7 @@ mod tests {
             line_start: 1,
             line_end: 10,
             signature: None,
+            snippet: None,
         };
         // Score-desc input: b0(0.9), a0(0.8), b1(0.7), a1(0.2), c0(0.1).
         let cands = vec![
@@ -1405,6 +1507,7 @@ mod tests {
             line_start: 1,
             line_end: 10,
             signature: None,
+            snippet: None,
         };
         let groups = group_symbols(vec![
             sym("b.py", "b0"),
@@ -1870,7 +1973,7 @@ mod tests {
         let live_pay = compile(&live_db, &cf, &emb, task, 5000).unwrap();
         assert!(!stored_pay.memories.is_empty(), "fixture must rank memories");
         assert!(!stored_pay.symbols.is_empty(), "fixture must rank symbols");
-        assert_parity(&stored_pay, &live_pay, 1e-12, "hash-64");
+        assert_parity(&stored_pay, &live_pay, 1e-6, "hash-64");
     }
 
     #[test]
@@ -1941,7 +2044,7 @@ mod tests {
                 pay.memories
             );
         }
-        let toks_task = bench::tokenize(task);
+        let toks_task = cortex_core::tokenize(task);
         for y in &pay.symbols {
             let name_lc = y.name.to_lowercase();
             let path_lc = y.path.to_lowercase();

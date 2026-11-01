@@ -17,5 +17,5 @@ toml = "0.8"
 dirs = "5"
 inquire = "0.7"
 indicatif = "0.17"
-bench = { path = "../bench" }
+cortex-core = { path = "../cortex-core" }
 fastembed = { version = "4", optional = true }

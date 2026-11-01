@@ -208,6 +208,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 name = "bench"
 version = "0.1.0"
 dependencies = [
+ "cortex-core",
  "serde",
  "serde_json",
  "tree-sitter",
@@ -430,8 +431,8 @@ checksum = "7f8f80099a98041a3d1622845c271458a2d73e688351bf3cb999266764b81d48"
 name = "cortex"
 version = "0.1.0"
 dependencies = [
- "bench",
  "clap",
+ "cortex-core",
  "dirs 5.0.1",
  "fastembed",
  "indicatif",
@@ -442,6 +443,16 @@ dependencies = [
  "thiserror 2.0.20",
  "toml",
  "ureq",
+]
+
+[[package]]
+name = "cortex-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tree-sitter",
+ "tree-sitter-python",
 ]
 
 [[package]]

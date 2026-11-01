@@ -29,9 +29,9 @@ use crate::corefile::CoreFile;
 use crate::embed::{EmbeddingProvider, HashEmbedder};
 use crate::session::Session;
 use crate::store::Store;
-use bench::bm25::Bm25Index;
-use bench::eval::bootstrap_ci;
-use bench::{count_tokens, tokenize, Rng};
+use cortex_core::bm25::Bm25Index;
+use cortex_core::eval::bootstrap_ci;
+use cortex_core::{count_tokens, tokenize, Rng};
 use serde::Serialize;
 use std::collections::HashSet;
 
@@ -725,6 +725,7 @@ mod tests {
                 line_start: 1,
                 line_end: 2,
                 signature: None,
+                snippet: None,
             }],
             tokens_used: 3,
             rho_naive: 0.0,

@@ -57,9 +57,6 @@ pub fn extract_file_symbols(path: &str, src: &str) -> Vec<RawSymbol> {
         Some(t) => t,
         None => return regex_fallback(path, src),
     };
-    if tree.root_node().has_error() {
-        return regex_fallback(path, src);
-    }
     let Some(query) = compiled_query() else {
         return regex_fallback(path, src);
     };
@@ -90,18 +87,21 @@ pub fn extract_file_symbols(path: &str, src: &str) -> Vec<RawSymbol> {
             Some(n) => n,
             None => continue,
         };
-        if name.is_empty() {
+        if name.is_empty() || n.is_missing() {
             continue;
         }
         let ls = n.start_position().row + 1;
-        let le = n.end_position().row + 1;
-        let text: String = lines.get(ls - 1..le.min(lines.len())).unwrap_or(&[]).join("\n");
+        let le_raw = n.end_position().row + 1;
+        let le_clamped = le_raw.min(ls + MAX_LINES - 1).min(lines.len());
+        let text: String = lines.get(ls - 1..le_clamped).unwrap_or(&[]).join("\n");
+        // Keep `le_raw` temporarily in `line_end` so class->method parent containment
+        // (`s.line_start >= cls_start && s.line_end <= cls_end`) works even for classes > 120 lines!
         pending.push(RawSymbol {
             path: path.to_string(),
             name,
             kind: if is_cls { "class".into() } else { "function".into() },
             line_start: ls,
-            line_end: le,
+            line_end: le_raw,
             text,
             parent: None,
         });
@@ -111,13 +111,18 @@ pub fn extract_file_symbols(path: &str, src: &str) -> Vec<RawSymbol> {
         .map(|s| (s.name.clone(), s.line_start, s.line_end)).collect();
     for s in pending.iter_mut() {
         if s.kind == "function" {
-            if let Some((cls, _, _)) = classes.iter().find(|(_, a, b)| s.line_start >= *a && s.line_end <= *b) {
+            // Pick innermost enclosing class if nested classes exist.
+            if let Some((cls, _, _)) = classes
+                .iter()
+                .filter(|(_, a, b)| s.line_start > *a && s.line_end <= *b)
+                .min_by_key(|(_, a, b)| b.saturating_sub(*a))
+            {
                 s.kind = "method".into();
                 s.parent = Some(cls.clone());
             }
         }
         let ls = s.line_start;
-        s.line_end = s.line_end.min(ls + MAX_LINES - 1);
+        s.line_end = s.line_end.min(ls + MAX_LINES - 1).min(lines.len().max(ls));
         out.push(s.clone());
     }
     out.retain(|s| s.text.len() >= MIN_CHARS);
@@ -444,12 +449,12 @@ mod tests {
     #[test]
     fn fallback_on_garbage_and_empty() {
         assert!(extract_file_symbols("a.py", "").is_empty());
-        let garbage = "def foo(a):\n    \"\"\"Docstring padding here.\"\"\"\n    return a + 1\nx = (1 +\n";
+        let garbage = "class Broken:\n    def foo(self, a):\n        \"\"\"Docstring padding here.\"\"\"\n        return a + 1\nx = (1 +\n";
         let syms = extract_file_symbols("a.py", garbage);
-        assert_eq!(syms.len(), 1);
-        assert_eq!(syms[0].name, "foo");
-        assert_eq!(syms[0].kind, "function");
-        assert!(syms[0].text.contains("return a + 1"));
+        let foo = syms.iter().find(|s| s.name == "foo").expect("foo extracted despite trailing syntax error");
+        assert_eq!(foo.kind, "method");
+        assert_eq!(foo.parent.as_deref(), Some("Broken"));
+        assert!(foo.text.contains("return a + 1"));
     }
 
     #[test]

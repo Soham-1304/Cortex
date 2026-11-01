@@ -42,7 +42,7 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 pub fn ranking(query_vec: &[f32], doc_vecs: &[Vec<f32>]) -> Vec<usize> {
     let mut sims: Vec<(usize, f32)> =
         doc_vecs.iter().enumerate().map(|(i, d)| (i, cosine(query_vec, d))).collect();
-    sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    sims.sort_by(|a, b| b.1.total_cmp(&a.1));
     sims.into_iter().map(|(i, _)| i).collect()
 }
 

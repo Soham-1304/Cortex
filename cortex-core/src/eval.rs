@@ -194,7 +194,7 @@ pub fn bootstrap_ci(values: &[f64], iters: usize, seed: u64) -> (f64, f64) {
         }
         means.push(s / n as f64);
     }
-    means.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    means.sort_by(|a, b| a.total_cmp(b));
     let lo_i = ((iters as f64 * 0.025) as usize).min(iters - 1);
     let hi_i = ((iters as f64 * 0.975) as usize).min(iters - 1);
     (means[lo_i], means[hi_i])
