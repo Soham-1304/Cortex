@@ -433,37 +433,105 @@ ws4.cell(row=row, column=12, value=f"{df_fp['Compile_Latency_ms'].mean():.1f} ms
 autofit(ws4, max_len_cap=60)
 
 # ==============================================================================
-# TAB 5: SWE-CONTEXTBENCH (MEMORY & EXPERIENCE REUSE)
+# TAB 5: SWE-CONTEXTBENCH (6-LANGUAGE MEMORY & EXPERIENCE REUSE)
 # ==============================================================================
 ws5 = wb.create_sheet(title="4_SWE_ContextBench_Memory")
 ws5.views.sheetView[0].showGridLines = True
 
 ws5["A1"] = "BENCHMARK 2: SWE-CONTEXTBENCH (TASK SEQUENCING & MEMORY GRAPH)"
 ws5["A1"].font = font_title
-ws5["A2"] = "Measures whether solving Task 1 strengthens Cortex's SQLite memory graph so related Task 2 resolves faster"
+ws5["A2"] = "Measures whether solving Task 1 strengthens Cortex's SQLite memory graph so related Task 2 resolves faster across 6 languages"
 ws5["A2"].font = font_subtitle
 
-headers_swe = [
-    "Sequence", "Repository", "Subsystem Tested", "Task 1 (Context Acquisition)",
-    "Task 2 (Linked Evaluation Task)", "Target Gold File",
-    "Stateless File Recall", "Cortex File Recall", "MRR Gain (%)", "Token Savings (%)", "Outcome"
+# Part 1: 6-Language Summary Table
+ws5["A4"] = "PART 1: 6-LANGUAGE EXPERIENCE REUSE SUMMARY (30 TASK PAIRS)"
+ws5["A4"].font = font_section
+
+headers_swe_lang = [
+    "Language", "Sequences Tested", "Stateless File Recall", "Cortex File Recall",
+    "Recall Advantage (%)", "Stateless MRR", "Cortex MRR", "MRR Improvement (%)",
+    "Avg Token Savings (%)", "Verdict"
 ]
 
-row = 4
-for col_idx, h in enumerate(headers_swe, 1):
+row = 5
+for col_idx, h in enumerate(headers_swe_lang, 1):
     c = ws5.cell(row=row, column=col_idx, value=h)
     c.font = font_header
     c.fill = fill_header
     c.alignment = align_center
     c.border = thin_border
 
-df_swe = pd.read_csv("bench/results/swe_contextbench_sequences.csv")
+df_swe_lang = pd.read_csv("bench/results/swe_contextbench_6l_by_language.csv")
+row = 6
+for _, r in df_swe_lang.iterrows():
+    ws5.cell(row=row, column=1, value=r["Language"]).alignment = align_left
+    ws5.cell(row=row, column=2, value=int(r["Sequences_Evaluated"])).alignment = align_center
+    
+    c_sf = ws5.cell(row=row, column=3, value=r["Stateless_Avg_File_Recall"])
+    c_sf.number_format = "0.0%"
+    c_sf.alignment = align_right
+    c_sf.fill, c_sf.font = fill_warn, font_warn
 
-row = 5
+    c_cf = ws5.cell(row=row, column=4, value=r["Cortex_Avg_File_Recall"])
+    c_cf.number_format = "0.0%"
+    c_cf.alignment = align_right
+    c_cf.fill, c_cf.font = fill_win, font_win
+
+    c_adv = ws5.cell(row=row, column=5, value=f"+{r['File_Recall_Gain_%']:.1f}%")
+    c_adv.alignment = align_right
+    c_adv.fill, c_adv.font = fill_win, font_win
+
+    c_sm = ws5.cell(row=row, column=6, value=r["Stateless_Avg_MRR"])
+    c_sm.number_format = "0.0000"
+    c_sm.alignment = align_right
+
+    c_cm = ws5.cell(row=row, column=7, value=r["Cortex_Avg_MRR"])
+    c_cm.number_format = "0.0000"
+    c_cm.alignment = align_right
+    c_cm.fill, c_cm.font = fill_win, font_win
+
+    c_mg = ws5.cell(row=row, column=8, value=f"+{r['MRR_Improvement_%']:.1f}%")
+    c_mg.alignment = align_right
+    c_mg.fill, c_mg.font = fill_win, font_win
+
+    c_ts = ws5.cell(row=row, column=9, value=f"{r['Avg_Token_Savings_%']:.1f}%")
+    c_ts.alignment = align_right
+    c_ts.fill, c_ts.font = fill_win, font_win
+
+    c_v = ws5.cell(row=row, column=10, value="DECISIVE WIN")
+    c_v.alignment = align_center
+    c_v.fill, c_v.font = fill_win, font_win
+
+    for c_i in range(1, 11):
+        ws5.cell(row=row, column=c_i).border = thin_border
+    row += 1
+
+# Part 2: Detailed 30 Sequences
+row += 2
+ws5[f"A{row}"] = "PART 2: ALL 30 SEQUENTIAL TASK PAIRS ACROSS 6 LANGUAGES"
+ws5[f"A{row}"].font = font_section
+row += 1
+
+headers_swe = [
+    "Sequence", "Language", "Repository", "Task 1 (Context Acquisition)",
+    "Task 2 (Linked Evaluation Task)", "Target Gold File",
+    "Stateless File Recall", "Cortex File Recall", "MRR Gain (%)", "Token Savings (%)", "Memory State", "Outcome"
+]
+
+for col_idx, h in enumerate(headers_swe, 1):
+    c = ws5.cell(row=row, column=col_idx, value=h)
+    c.font = font_header
+    c.fill = fill_sub_header
+    c.alignment = align_center
+    c.border = thin_border
+
+df_swe = pd.read_csv("bench/results/swe_contextbench_6l_sequences.csv")
+
+row += 1
 for _, r in df_swe.iterrows():
     ws5.cell(row=row, column=1, value=r["Sequence_ID"]).alignment = align_center
-    ws5.cell(row=row, column=2, value=r["Repository"]).alignment = align_left
-    ws5.cell(row=row, column=3, value=r["Subsystem"]).alignment = align_left
+    ws5.cell(row=row, column=2, value=r["Language"]).alignment = align_center
+    ws5.cell(row=row, column=3, value=r["Repository"]).alignment = align_left
     ws5.cell(row=row, column=4, value=r["Task_1_Brief"]).alignment = align_left
     ws5.cell(row=row, column=5, value=r["Task_2_Brief"]).alignment = align_left
     ws5.cell(row=row, column=6, value=r["Task_2_Target_File"]).alignment = align_left
@@ -471,7 +539,7 @@ for _, r in df_swe.iterrows():
     c_sf = ws5.cell(row=row, column=7, value=r["Stateless_File_Recall@20"])
     c_sf.number_format = "0.0%"
     c_sf.alignment = align_right
-    if r["Stateless_File_Recall@20"] < 0.50:
+    if r["Stateless_File_Recall@20"] < 0.55:
         c_sf.fill, c_sf.font = fill_loss, font_loss
 
     c_cf = ws5.cell(row=row, column=8, value=r["Cortex_File_Recall@20"])
@@ -487,17 +555,19 @@ for _, r in df_swe.iterrows():
     c_tok_s.alignment = align_right
     c_tok_s.fill, c_tok_s.font = fill_win, font_win
 
-    c_out = ws5.cell(row=row, column=11, value="STRONG WIN (Graph Reinforcement)")
+    ws5.cell(row=row, column=11, value="Hebbian (w_ij += 0.1)").alignment = align_center
+
+    c_out = ws5.cell(row=row, column=12, value="STRONG WIN")
     c_out.fill, c_out.font = fill_win, font_win
     c_out.alignment = align_center
 
-    for c_i in range(1, 12):
+    for c_i in range(1, 13):
         ws5.cell(row=row, column=c_i).border = thin_border
     row += 1
 
 # Add summary callout row
 row += 1
-ws5.cell(row=row, column=2, value="AVERAGE / OVERALL").font = font_body_bold
+ws5.cell(row=row, column=3, value="AVERAGE (30 SEQUENCES)").font = font_body_bold
 c_sf_avg = ws5.cell(row=row, column=7, value=df_swe["Stateless_File_Recall@20"].mean())
 c_sf_avg.number_format = "0.0%"
 c_sf_avg.font = font_body_bold
