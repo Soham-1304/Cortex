@@ -81,7 +81,12 @@ const MIGRATIONS: &[&str] = &[
 
 impl Store {
     pub fn open_in_memory() -> Result<Self> { Self::open(Connection::open_in_memory()?) }
-    pub fn open_at(path: &str) -> Result<Self> { Self::open(Connection::open(path)?) }
+    pub fn open_at(path: &str) -> Result<Self> {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        Self::open(Connection::open(path)?)
+    }
     fn open(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.execute_batch(SCHEMA)?;

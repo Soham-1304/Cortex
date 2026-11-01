@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import random
 import subprocess
 import sys
 import time
@@ -24,7 +25,13 @@ LOGS_DIR = ROOT / "bench" / "results" / "logs"
 EPISODES_DIR = LOGS_DIR / "episodes"
 MARKDOWN_DIR = LOGS_DIR / "markdown"
 INDEX_HTML = LOGS_DIR / "index.html"
-AGENT_EVAL_SCRIPT = ROOT / "bench" / "scripts" / "agent_eval.py"
+OUT_RESULTS = ROOT / "bench" / "results" / "decisive_suite_results.jsonl"
+CORTEX_BIN = os.environ.get("CORTEX_BIN", str(Path.home() / ".cargo" / "bin" / "cortex"))
+
+# Add bench/scripts to sys.path so we can import agent_eval and agent_logger
+sys.path.insert(0, str(ROOT / "bench" / "scripts"))
+from agent_eval import Llm, run_episode, score
+from agent_logger import EpisodeLogger, generate_interactive_html
 
 # Local fixture directory map for pre-indexed repositories
 REPO_MAP = {
@@ -46,14 +53,43 @@ REPO_MAP = {
                       ROOT / "bench" / "fixtures" / "contextbench_zstd" / "repos" / "facebook__zstd"),
 }
 
+CACHE_REPOS_DIR = ROOT / "bench" / "fixtures" / "repos_cache"
+
+
+def ensure_repo_and_index(repo_name, repo_url=None):
+    """Ensures repository is checked out and has a .cortex index."""
+    if repo_name in REPO_MAP:
+        repo_dir, work_dir = REPO_MAP[repo_name]
+    else:
+        owner, rname = repo_name.split("/")
+        repo_dir = CACHE_REPOS_DIR / f"{owner}__{rname}"
+        work_dir = repo_dir
+        if not repo_dir.is_dir():
+            CACHE_REPOS_DIR.mkdir(parents=True, exist_ok=True)
+            url = repo_url or f"https://github.com/{repo_name}.git"
+            print(f"[CLONE] Cloning {repo_name} into {repo_dir}...")
+            subprocess.run(["git", "clone", "--depth", "1", "--quiet", url, str(repo_dir)], check=True)
+
+    db_path = work_dir / ".cortex" / "memory.db"
+    cfg_path = work_dir / ".cortex" / "config.toml"
+    if not db_path.is_file() or db_path.stat().st_size == 0 or not cfg_path.is_file():
+        print(f"[INDEX] Building Cortex index for {repo_name} at {work_dir}...")
+        (work_dir / ".cortex").mkdir(parents=True, exist_ok=True)
+        with open(cfg_path, "w") as f:
+            f.write('provider = "hash"\ndim = 64\nmodel = "hash"\n')
+        subprocess.run([CORTEX_BIN, "index", ".", "--embed", "hash"], cwd=str(work_dir), check=True)
+
+    return str(repo_dir), str(work_dir)
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="models/gemini-3.5-flash")
     ap.add_argument("--provider", default="gemini")
     ap.add_argument("--arms", default="tool,base")
+    ap.add_argument("--language", default="ALL", help="Filter by language (e.g. Python, Rust, Go, or ALL)")
     ap.add_argument("--limit-per-lang", type=int, default=12)
-    ap.add_argument("--pacing-delay", type=float, default=5.0, help="Seconds to sleep between tasks to respect TPM quota")
+    ap.add_argument("--pacing-delay", type=float, default=4.0, help="Seconds to sleep between calls to respect TPM quota")
     ap.add_argument("--dry-run", action="store_true", help="Print plan and exit without making API calls")
     args = ap.parse_args()
 
@@ -63,28 +99,126 @@ def main():
     with open(FIXTURES_FILE, "r", encoding="utf-8") as f:
         all_tasks = [json.loads(line) for line in f if line.strip()]
 
-    print("=" * 80)
-    print(f"CORTEX DECISIVE EVALUATION SUITE: 72 REAL TASKS")
-    print(f"Model: {args.model} ({args.provider}) | Arms: {args.arms}")
-    print(f"Fixtures: {FIXTURES_FILE} ({len(all_tasks)} total tasks)")
-    print(f"Logs output: {LOGS_DIR}")
-    print("=" * 80)
+    # Filter tasks by language
+    if args.language != "ALL":
+        all_tasks = [t for t in all_tasks if t["language"].lower() == args.language.lower()]
 
-    # Group by language
-    by_lang = {}
-    for t in all_tasks:
-        by_lang.setdefault(t["language"], []).append(t)
+    arms = [a.strip() for a in args.arms.split(",")]
+    EPISODES_DIR.mkdir(parents=True, exist_ok=True)
+    MARKDOWN_DIR.mkdir(parents=True, exist_ok=True)
 
-    for lang, tasks in sorted(by_lang.items()):
-        print(f"\n[{lang}] {len(tasks)} tasks:")
-        for t in tasks[:args.limit_per_lang]:
-            print(f"  * {t['repo']} ({t.get('domain', '')}): {t['instance_id'][-12:]} - {t['problem_statement'][:60].replace(chr(10), ' ')}...")
+    print("=" * 80)
+    print(f"CORTEX DECISIVE EVALUATION SUITE")
+    print(f"Model: {args.model} ({args.provider}) | Arms: {arms}")
+    print(f"Fixtures: {len(all_tasks)} tasks selected (Language filter: {args.language})")
+    print(f"Logs: {LOGS_DIR}")
+    print("=" * 80)
 
     if args.dry_run:
         print("\n[DRY RUN] Plan displayed. Exiting without execution.")
         return
 
-    print("\nStarting execution... (Run paused pending user review)")
+    # Load existing done records
+    done_records = {}
+    if OUT_RESULTS.is_file():
+        with open(OUT_RESULTS, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    try:
+                        rec = json.loads(line)
+                        done_records[rec["id"]] = rec
+                    except Exception:
+                        pass
+        print(f"[RESUME] Found {len(done_records)} previously completed tasks in {OUT_RESULTS}")
+
+    llm = Llm(args.provider, args.model)
+    completed = 0
+    total = len(all_tasks)
+
+    with open(OUT_RESULTS, "a", encoding="utf-8") as out_f:
+        for idx, t in enumerate(all_tasks, 1):
+            t_id = t["instance_id"]
+            repo_name = t["repo"]
+            lang = t["language"]
+            domain = t.get("domain", "")
+
+            if t_id in done_records:
+                print(f"[{idx}/{total}] SKIP (already done): {t_id[-12:]} ({repo_name})")
+                continue
+
+            print(f"\n[{idx}/{total}] TASK: {t_id[-12:]} | {lang} | {repo_name} ({domain})")
+            print(f"  Issue: {t['problem_statement'][:100].replace(chr(10), ' ')}...")
+
+            try:
+                repo_path, work_path = ensure_repo_and_index(repo_name, t.get("repo_url"))
+            except Exception as ex:
+                print(f"  [ERROR] Failed to prepare repo {repo_name}: {ex}")
+                continue
+
+            gold = t.get("gold_context", [])
+            row = {
+                "id": t_id,
+                "repo": repo_name,
+                "language": lang,
+                "domain": domain,
+                "model": args.model,
+                "gold_files": len(t.get("gold_files", [])),
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+
+            # Evaluate arms in randomized order per task
+            eval_order = arms[:]
+            random.Random(t_id).shuffle(eval_order)
+
+            for arm in eval_order:
+                print(f"  --> Running Arm: {arm}...", end=" ", flush=True)
+                clean_id = t_id.replace("/", "__")
+                logger = EpisodeLogger(
+                    task_id=t_id,
+                    repo=repo_name,
+                    language=lang,
+                    arm=arm,
+                    model=args.model,
+                    problem_statement=t["problem_statement"],
+                    gold_context=gold,
+                )
+
+                t_start = time.time()
+                r = run_episode(llm, repo_path, work_path, t["problem_statement"], arm, max_steps=15, logger=logger)
+                sc = score(r["final"], gold)
+                r.update(sc)
+                row[arm] = r
+
+                logger.finish(r["final"], sc, r["error"])
+                logger.save_json(EPISODES_DIR / f"{clean_id}_{arm}.json")
+                logger.save_markdown(MARKDOWN_DIR / f"{clean_id}_{arm}.md")
+                generate_interactive_html(EPISODES_DIR, INDEX_HTML)
+
+                f1 = sc.get("file_f1", 0.0)
+                sub = sc.get("submitted", False)
+                retries = r.get("retries", 0)
+                print(f"done in {r['wall_s']}s (cogn={logger.cognitive_s}s, 429_wait={logger.rate_limit_wait_s}s) | "
+                      f"turns={r['turns']} tok={r['prompt_tokens']+r['completion_tokens']} | F1={f1:.2f} "
+                      f"{'[SOLVED]' if f1 == 1.0 else '[PARTIAL]' if f1 > 0 else '[FAIL]'} "
+                      f"{f'⚠️ {retries} retries' if retries else ''}")
+
+                # Pacing sleep between arms to prevent quota spikes
+                if args.pacing_delay > 0:
+                    time.sleep(args.pacing_delay)
+
+            out_f.write(json.dumps(row) + "\n")
+            out_f.flush()
+            completed += 1
+
+            # Pacing sleep between tasks
+            if args.pacing_delay > 0:
+                time.sleep(args.pacing_delay)
+
+    print("\n" + "=" * 80)
+    print(f"SUITE COMPLETE: Evaluated {completed} tasks.")
+    print(f"Results saved to: {OUT_RESULTS}")
+    print(f"Interactive Dashboard updated: {INDEX_HTML}")
+    print("=" * 80)
 
 
 if __name__ == "__main__":

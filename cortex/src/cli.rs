@@ -1404,6 +1404,16 @@ fn parse_import_generic(t: &str, lang: &str) -> Option<(String, String, Option<S
     }
 }
 
+fn safe_truncate(s: &mut String, max_len: usize) {
+    if s.len() > max_len {
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+}
+
 /// Generic use-ref extraction for non-Python files (point 3): imports +
 /// call sites with single-line context, into `code_refs_use` rows.
 /// Dotted calls emit full + short names (mirrors the Python indexer);
@@ -1430,9 +1440,7 @@ fn extract_uses_generic(text: &str, lang: &str) -> RefUsesVec {
                 }
                 if let Some(m) = quoted_mod(t) {
                     let mut ctx = t.to_string();
-                    if ctx.len() > 200 {
-                        ctx.truncate(200);
-                    }
+                    safe_truncate(&mut ctx, 200);
                     out.push((m.clone(), "import".into(), ln, ctx.clone(), None));
                     if let Some(top) = top_segment(&m) {
                         out.push((top, "import".into(), ln, ctx, Some(m)));
@@ -1449,9 +1457,7 @@ fn extract_uses_generic(text: &str, lang: &str) -> RefUsesVec {
             continue;
         }
         let mut ctx = t.to_string();
-        if ctx.len() > 200 {
-            ctx.truncate(200);
-        }
+        safe_truncate(&mut ctx, 200);
         if let Some((name, kind, target)) = parse_import_generic(t, lang) {
             out.push((name.clone(), kind.clone(), ln, ctx.clone(), target.clone()));
             if kind == "import" {
