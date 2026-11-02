@@ -37,6 +37,7 @@ bench/results/
 bench/fixtures/contextbench_*/repos/
 bench/fixtures/contextbench_*/corpus_raw.json
 bench/fixtures/contextbench_*/embed_cache_*.json
+bench/fixtures/embed_cache_*.json
 bench/fixtures/contextbench_*/tasks.jsonl
 bench/fixtures/ts_*/
 bench/fixtures/repos_cache/

@@ -20,4 +20,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo run -q -p bench --bin bench -- --fixtures fixtures/contextbench_sample --embed hash --budget 120,200
+      - run: cargo run -q -p bench --bin bench -- --fixtures bench/fixtures --embed hash --budget 120,200
