@@ -14,6 +14,7 @@ Features:
 """
 
 import os
+import json
 import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -589,20 +590,21 @@ c_ts_avg.fill = fill_win
 autofit(ws5, max_len_cap=60)
 
 # ==============================================================================
-# TAB 6: REAL AGENT LIVE TEST (SWE-BENCH WITH RATE-LIMIT ISOLATION)
+# TAB 6: REAL AGENT LIVE TEST (SWE-BENCH MULTI-TURN EVALUATION)
 # ==============================================================================
 ws6 = wb.create_sheet(title="5_Real_Agent_Live_Test")
 ws6.views.sheetView[0].showGridLines = True
 
-ws6["A1"] = "BENCHMARK 4: REAL AGENT SWE-BENCH LIVE EVALUATION"
+ws6["A1"] = "BENCHMARK 5: REAL AGENT SWE-BENCH MULTI-TURN EVALUATION (10 TASKS)"
 ws6["A1"].font = font_title
-ws6["A2"] = "Autonomous agent bug localization test using live Google Gemini 3.5 Flash API with rate-limit isolation"
+ws6["A2"] = "Head-to-head multi-turn agent evaluation using Mistral Codestral: Cortex Memory Tool vs Direct Search Baseline"
 ws6["A2"].font = font_subtitle
 
 headers_agent = [
-    "Test Arm", "AI Model Used", "Task Resolution (F1)", "File Recall",
-    "Wall-Clock Time", "Speedup vs Baseline", "Total API Calls", "Tool Search Retries",
-    "HTTP 429 Backoffs", "Submitted Fix?", "Operational Difference"
+    "Task ID", "Repository", "Language", "Winner",
+    "Cortex Turns", "Base Turns", "Turns Saved",
+    "Cortex Tokens", "Base Tokens", "Tokens Saved", "Token Savings (%)",
+    "Cortex F1", "Base F1", "Cortex Wall (s)", "Base Wall (s)"
 ]
 
 row = 4
@@ -613,54 +615,233 @@ for col_idx, h in enumerate(headers_agent, 1):
     c.alignment = align_center
     c.border = thin_border
 
-agent_rows = [
-    ("Without Cortex (Base Agent)", "models/gemini-3.5-flash", 1.00, 1.00, 78.00, "1.0x (Baseline)", 8, 4, 0, "YES", "Agent searched blindly via grep/find; suffered 4 retries before locating code.", fill_loss, font_loss),
-    ("With Cortex (MCP Tool)", "models/gemini-3.5-flash", 1.00, 1.00, 17.48, "4.5x FASTER (-60.5s)", 6, 0, 0, "YES", "Agent called cortex_search on Turn 1; instantly jumped to exact file with zero retries.", fill_win, font_win),
-]
+repo_lang_map = {
+    "astropy/astropy": ("astropy/astropy", "Python"),
+    "django/django": ("django/django", "Python"),
+    "psf/requests": ("psf/requests", "Python"),
+    "sympy/sympy": ("sympy/sympy", "Python"),
+    "facebook/zstd": ("facebook/zstd", "C"),
+    "iamkun/dayjs": ("iamkun/dayjs", "JavaScript"),
+}
 
-row = 5
-for arm, model, f1, rec, wall_s, speedup, calls, retries, backoffs, sub, diff, fill, font in agent_rows:
-    ws6.cell(row=row, column=1, value=arm).alignment = align_left
-    ws6.cell(row=row, column=2, value=model).alignment = align_center
-    
-    c_f1 = ws6.cell(row=row, column=3, value=f1)
-    c_f1.number_format = "0.00"
-    c_f1.alignment = align_center
-    c_f1.fill, c_f1.font = fill_win, font_win
+task_manifest_map = {}
+if os.path.exists("bench/fixtures/multiturn_10_tasks.jsonl"):
+    with open("bench/fixtures/multiturn_10_tasks.jsonl") as mf:
+        for ml in mf:
+            mt = json.loads(ml)
+            task_manifest_map[mt["instance_id"]] = (mt.get("repo", ""), mt.get("language", ""))
 
-    c_rec = ws6.cell(row=row, column=4, value=rec)
-    c_rec.number_format = "0.00"
-    c_rec.alignment = align_center
-    c_rec.fill, c_rec.font = fill_win, font_win
+agent_eval_file = os.path.join(OUT_DIR, "agent_eval_codestral_10.jsonl")
+tot_cx_tok, tot_base_tok, tot_cx_turns, tot_base_turns = 0, 0, 0, 0
+count = 0
 
-    c_wall = ws6.cell(row=row, column=5, value=f"{wall_s:.2f} s")
-    c_wall.alignment = align_right
-    c_wall.fill, c_wall.font = fill, font
+if os.path.isfile(agent_eval_file):
+    row = 5
+    with open(agent_eval_file, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            b = r.get("base", {})
+            t = r.get("tool", {})
+            tid = r.get("id", "")
+            repo, lang = task_manifest_map.get(tid, ("unknown", "python"))
+            
+            b_tok = b.get("prompt_tokens", 0) + b.get("completion_tokens", 0)
+            t_tok = t.get("prompt_tokens", 0) + t.get("completion_tokens", 0)
+            b_turns = b.get("turns", 0)
+            t_turns = t.get("turns", 0)
+            
+            tot_base_tok += b_tok
+            tot_cx_tok += t_tok
+            tot_base_turns += b_turns
+            tot_cx_turns += t_turns
+            count += 1
+            
+            tok_saved = b_tok - t_tok
+            turn_saved = b_turns - t_turns
+            tok_pct = (tok_saved / max(1, b_tok)) * 100.0
+            
+            if tok_saved > 500 or turn_saved > 0:
+                winner = "CORTEX"
+                f_win, f_font = fill_win, font_win
+            elif tok_saved < -500 or turn_saved < 0:
+                winner = "BASELINE"
+                f_win, f_font = fill_loss, font_loss
+            else:
+                winner = "TIE"
+                f_win, f_font = fill_warn, font_warn
 
-    c_spd = ws6.cell(row=row, column=6, value=speedup)
-    c_spd.alignment = align_center
-    c_spd.fill, c_spd.font = fill, font
+            ws6.cell(row=row, column=1, value=tid[-8:]).alignment = align_center
+            ws6.cell(row=row, column=2, value=repo).alignment = align_left
+            ws6.cell(row=row, column=3, value=lang.capitalize()).alignment = align_center
+            
+            c_w = ws6.cell(row=row, column=4, value=winner)
+            c_w.alignment = align_center
+            c_w.fill, c_w.font = f_win, f_font
+            
+            ws6.cell(row=row, column=5, value=t_turns).alignment = align_center
+            ws6.cell(row=row, column=6, value=b_turns).alignment = align_center
+            
+            c_ts = ws6.cell(row=row, column=7, value=f"{turn_saved:+d}" if turn_saved != 0 else "0")
+            c_ts.alignment = align_center
+            if turn_saved > 0:
+                c_ts.fill, c_ts.font = fill_win, font_win
+            elif turn_saved < 0:
+                c_ts.fill, c_ts.font = fill_loss, font_loss
 
-    c_calls = ws6.cell(row=row, column=7, value=calls)
-    c_calls.alignment = align_center
-    c_calls.fill, c_calls.font = fill, font
+            ws6.cell(row=row, column=8, value=t_tok).alignment = align_right
+            ws6.cell(row=row, column=9, value=b_tok).alignment = align_right
+            
+            c_tks = ws6.cell(row=row, column=10, value=f"{tok_saved:+d}")
+            c_tks.alignment = align_right
+            if tok_saved > 0:
+                c_tks.fill, c_tks.font = fill_win, font_win
+            elif tok_saved < 0:
+                c_tks.fill, c_tks.font = fill_loss, font_loss
 
-    c_ret = ws6.cell(row=row, column=8, value=retries)
-    c_ret.alignment = align_center
-    c_ret.fill, c_ret.font = fill, font
+            c_pct = ws6.cell(row=row, column=11, value=f"{tok_pct:+.1f}%")
+            c_pct.alignment = align_right
+            if tok_pct > 0:
+                c_pct.fill, c_pct.font = fill_win, font_win
+            elif tok_pct < 0:
+                c_pct.fill, c_pct.font = fill_loss, font_loss
 
-    c_bk = ws6.cell(row=row, column=9, value=backoffs)
-    c_bk.alignment = align_center
-    c_bk.fill, c_bk.font = fill_win, font_win
+            c_tf1 = ws6.cell(row=row, column=12, value=t.get("file_f1", 0.0))
+            c_tf1.number_format = "0.00"
+            c_tf1.alignment = align_center
+            
+            c_bf1 = ws6.cell(row=row, column=13, value=b.get("file_f1", 0.0))
+            c_bf1.number_format = "0.00"
+            c_bf1.alignment = align_center
+            
+            ws6.cell(row=row, column=14, value=f"{t.get('wall_s', 0.0):.2f}s").alignment = align_right
+            ws6.cell(row=row, column=15, value=f"{b.get('wall_s', 0.0):.2f}s").alignment = align_right
 
-    ws6.cell(row=row, column=10, value=sub).alignment = align_center
-    ws6.cell(row=row, column=11, value=diff).alignment = align_left
+            for c_i in range(1, 16):
+                ws6.cell(row=row, column=c_i).border = thin_border
+            row += 1
 
-    for c_i in range(1, 12):
-        ws6.cell(row=row, column=c_i).border = thin_border
-    row += 1
+    # Summary Row
+    if count > 0:
+        row += 1
+        ws6.cell(row=row, column=2, value="AVERAGE (10 TASKS)").font = font_body_bold
+        
+        c_avg_cx_turns = ws6.cell(row=row, column=5, value=round(tot_cx_turns / count, 1))
+        c_avg_cx_turns.alignment = align_center
+        c_avg_cx_turns.font = font_win
+        c_avg_cx_turns.fill = fill_win
+        
+        c_avg_b_turns = ws6.cell(row=row, column=6, value=round(tot_base_turns / count, 1))
+        c_avg_b_turns.alignment = align_center
+        c_avg_b_turns.font = font_body_bold
+        
+        c_avg_saved_turns = ws6.cell(row=row, column=7, value=f"{(tot_base_turns - tot_cx_turns)/count:+.1f} turns")
+        c_avg_saved_turns.alignment = align_center
+        c_avg_saved_turns.font = font_win
+        c_avg_saved_turns.fill = fill_win
+
+        c_avg_cx_tok = ws6.cell(row=row, column=8, value=int(tot_cx_tok / count))
+        c_avg_cx_tok.alignment = align_right
+        c_avg_cx_tok.font = font_win
+        c_avg_cx_tok.fill = fill_win
+
+        c_avg_b_tok = ws6.cell(row=row, column=9, value=int(tot_base_tok / count))
+        c_avg_b_tok.alignment = align_right
+        c_avg_b_tok.font = font_body_bold
+
+        avg_tok_diff = (tot_base_tok - tot_cx_tok) / count
+        c_avg_diff = ws6.cell(row=row, column=10, value=f"{int(avg_tok_diff):+d} tok")
+        c_avg_diff.alignment = align_right
+        c_avg_diff.font = font_win
+        c_avg_diff.fill = fill_win
+
+        avg_pct_diff = ((tot_base_tok - tot_cx_tok) / max(1, tot_base_tok)) * 100.0
+        c_avg_pct = ws6.cell(row=row, column=11, value=f"{avg_pct_diff:+.1f}%")
+        c_avg_pct.alignment = align_right
+        c_avg_pct.font = font_win
+        c_avg_pct.fill = fill_win
 
 autofit(ws6, max_len_cap=65)
+
+# ==============================================================================
+# TAB 7: 158-TASK DECISIVE HEAD-TO-HEAD BENCHMARK
+# ==============================================================================
+ws7 = wb.create_sheet(title="6_Decisive_158_Tasks")
+ws7.views.sheetView[0].showGridLines = True
+
+ws7["A1"] = "HEAD-TO-HEAD DECISIVE BENCHMARK: 158 REAL SWE-BENCH TASKS"
+ws7["A1"].font = font_title
+ws7["A2"] = "Direct empirical evaluation across 6 languages: Cortex Code Intelligence vs Raw Keyword/Ripgrep Baseline"
+ws7["A2"].font = font_subtitle
+
+headers_158 = [
+    "Task ID", "Repository", "Language", "Winner",
+    "Cortex F1", "Baseline F1", "1st Turn Hit (FTLR)", "Noise Distraction (Cx vs Base)",
+    "Cortex Latency (ms)", "Baseline Latency (ms)",
+    "Cortex Tokens", "Baseline Tokens", "Tokens Saved (%)"
+]
+
+row = 4
+for col_idx, h in enumerate(headers_158, 1):
+    c = ws7.cell(row=row, column=col_idx, value=h)
+    c.font = font_header
+    c.fill = fill_header
+    c.alignment = align_center
+    c.border = thin_border
+
+results_path = os.path.join(OUT_DIR, "decisive_suite_results.jsonl")
+if os.path.isfile(results_path):
+    row = 5
+    with open(results_path, "r", encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            w = r.get("winner", "TIE")
+            f_win = fill_win if w == "CORTEX" else (fill_loss if w == "BASELINE" else fill_warn)
+            f_font = font_win if w == "CORTEX" else (font_loss if w == "BASELINE" else font_warn)
+
+            ws7.cell(row=row, column=1, value=r.get("id", "")[-14:]).alignment = align_center
+            ws7.cell(row=row, column=2, value=r.get("repo", "")).alignment = align_left
+            ws7.cell(row=row, column=3, value=r.get("language", "")).alignment = align_center
+            
+            c_w = ws7.cell(row=row, column=4, value=w)
+            c_w.alignment = align_center
+            c_w.fill, c_w.font = f_win, f_font
+
+            c_cf1 = ws7.cell(row=row, column=5, value=r["cortex"]["f1"])
+            c_cf1.number_format = "0.00"
+            c_cf1.alignment = align_center
+
+            c_bf1 = ws7.cell(row=row, column=6, value=r["baseline"]["f1"])
+            c_bf1.number_format = "0.00"
+            c_bf1.alignment = align_center
+
+            ws7.cell(row=row, column=7, value="YES" if r["cortex"].get("ftlr", 0) > 0 else "NO").alignment = align_center
+            ws7.cell(row=row, column=8, value=f"{r['cortex'].get('noise_pct', 0):.0f}% vs {r['baseline'].get('noise_pct', 0):.0f}%").alignment = align_center
+
+            ws7.cell(row=row, column=9, value=r["cortex"]["latency_ms"]).alignment = align_right
+            ws7.cell(row=row, column=10, value=r["baseline"]["latency_ms"]).alignment = align_right
+
+            c_ctok = ws7.cell(row=row, column=11, value=r["cortex"]["tokens"])
+            c_ctok.alignment = align_right
+            c_ctok.number_format = "#,##0"
+
+            c_btok = ws7.cell(row=row, column=12, value=r["baseline"]["tokens"])
+            c_btok.alignment = align_right
+            c_btok.number_format = "#,##0"
+
+            c_sav = ws7.cell(row=row, column=13, value=f"{r.get('tokens_saved_pct', 0):.1f}%")
+            c_sav.alignment = align_right
+            if r.get("tokens_saved_pct", 0) > 0:
+                c_sav.fill, c_sav.font = fill_win, font_win
+
+            for c_i in range(1, 14):
+                ws7.cell(row=row, column=c_i).border = thin_border
+            row += 1
+
+autofit(ws7, max_len_cap=45)
 
 # Save both workbooks
 wb.save(EXCEL_PATH)

@@ -39,8 +39,13 @@ bench/fixtures/contextbench_*/corpus_raw.json
 bench/fixtures/contextbench_*/embed_cache_*.json
 bench/fixtures/contextbench_*/tasks.jsonl
 bench/fixtures/ts_*/
+bench/fixtures/repos_cache/
+bench/fixtures/task_*.jsonl
 bench/scripts/__pycache__/
 *.pyc
+
+# Agent transient scratch
+.agents/
 
 # Misc temporary files
 package-lock.json

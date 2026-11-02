@@ -49,6 +49,8 @@ if env_file.is_file():
 PROVIDERS = {
     "groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
     "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "GEMINI_API_KEY"),
+    "openrouter": ("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
+    "mistral": ("https://api.mistral.ai/v1", "MISTRAL_API_KEY"),
 }
 SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules", "dist", "build", ".cortex", ".tox"}
 TOOL_OUT_CHARS = 2500   # identical truncation in every arm
@@ -93,7 +95,7 @@ class RollingTokenLimiter:
         self._prune(now)
 
 
-GLOBAL_TOKEN_LIMITER = RollingTokenLimiter(max_tpm=12000, window_s=60.0)
+GLOBAL_TOKEN_LIMITER = RollingTokenLimiter(max_tpm=int(os.environ.get("GEMINI_MAX_TPM", "240000")), window_s=60.0)
 
 
 def prune_messages(msgs, max_chars=8000):
@@ -285,8 +287,12 @@ def cortex_context(workdir, query, budget=2000):
     r = subprocess.run([CORTEX, "recall", query, "--budget", str(budget), "--json"],
                        capture_output=True, text=True, cwd=workdir, timeout=180)
     out = r.stdout
+    s_idx = out.find("{")
+    e_idx = out.rfind("}")
+    if s_idx == -1 or e_idx == -1:
+        return "cortex: no result"
     try:
-        p = json.loads(out[out.find("{"):])
+        p = json.loads(out[s_idx:e_idx+1])
     except Exception:
         return "cortex: no result"
     lines = []
@@ -295,6 +301,59 @@ def cortex_context(workdir, query, budget=2000):
     for m in p.get("memories", []):
         lines.append(f"note: {m.get('content','')[:200]}")
     return _clip("\n".join(lines) or "cortex: nothing relevant indexed")
+
+
+def cortex_find(workdir, query, n=10):
+    r = subprocess.run([CORTEX, "find", str(query), "-n", str(n), "--json"],
+                       capture_output=True, text=True, cwd=workdir, timeout=60)
+    out = r.stdout
+    s_idx, e_idx = out.find("{"), out.rfind("}")
+    if s_idx == -1 or e_idx == -1:
+        return "cortex_find: no definitions or connections found"
+    try:
+        p = json.loads(out[s_idx:e_idx+1])
+    except Exception:
+        return "cortex_find: error parsing output"
+    lines = []
+    for d in p.get("defs", []):
+        lines.append(f"def: {d.get('path')}:{d.get('line')} ({d.get('kind', 'symbol')})")
+    for f in p.get("fts", [])[:10]:
+        lines.append(f"match: {f.get('path')}:{f.get('line')} -> {f.get('context', '').strip()[:100]}")
+    for c in p.get("connections", [])[:5]:
+        lines.append(f"conn: {c.get('file')} imports {c.get('imports', [])[:4]}")
+    return _clip("\n".join(lines) or "cortex_find: no matches")
+
+
+def cortex_map(workdir, query):
+    r = subprocess.run([CORTEX, "map", str(query), "--json"],
+                       capture_output=True, text=True, cwd=workdir, timeout=60)
+    out = r.stdout
+    s_idx, e_idx = out.find("{"), out.rfind("}")
+    if s_idx == -1 or e_idx == -1:
+        return "cortex_map: no roadmap found"
+    try:
+        p = json.loads(out[s_idx:e_idx+1])
+    except Exception:
+        return "cortex_map: error parsing output"
+    lines = []
+    for ep in p.get("entry_points", [])[:5]:
+        lines.append(f"entry_point: {ep.get('file')} imports {ep.get('imports', [])[:5]}")
+    for ref in p.get("referenced_by", [])[:5]:
+        lines.append(f"referenced_by: {ref.get('file')}")
+    return _clip("\n".join(lines) or "cortex_map: empty roadmap")
+
+
+def cortex_remember(workdir, content, kind="note"):
+    r = subprocess.run([CORTEX, "remember", str(content), "--kind", str(kind)],
+                       capture_output=True, text=True, cwd=workdir, timeout=30)
+    out = r.stdout.strip()
+    return f"cortex_remember: saved memory note id={out}" if out else "cortex_remember: saved"
+
+
+def cortex_feedback(workdir, note_id, verdict="useful"):
+    r = subprocess.run([CORTEX, "feedback", str(note_id), str(verdict)],
+                       capture_output=True, text=True, cwd=workdir, timeout=30)
+    return f"cortex_feedback: reinforced note {note_id} as {verdict}"
 
 
 def tool_specs(with_cortex):
@@ -312,9 +371,21 @@ def tool_specs(with_cortex):
     ]
     if with_cortex:
         specs.append(fn("cortex_search",
-                        "Ask the project memory index for the symbols most relevant to a "
+                        "Ask the project memory index for the symbols, source snippets, and past memories most relevant to a "
                         "description. Returns file:line ranges + signatures. Fast, local.",
-                        {"query": s("natural-language description or identifiers")}, ["query"]))
+                        {"query": s("natural-language description or identifiers"), "budget": i("token budget, default 1500")}, ["query"]))
+        specs.append(fn("cortex_find",
+                        "Exact AST identifier lookup: find exact definitions, usages, and call sites of a symbol name across files. Skips embeddings for high precision.",
+                        {"query": s("symbol or function name to locate"), "n": i("max matches, default 10")}, ["query"]))
+        specs.append(fn("cortex_map",
+                        "File roadmap: discover architectural entry points, imports, and inbound references for files around keywords (under 1k tokens).",
+                        {"query": s("file path or module keyword")}, ["query"]))
+        specs.append(fn("cortex_remember",
+                        "Store a key architectural note, bug hypothesis, or verified fix in the persistent project memory graph so subsequent tasks can recall it.",
+                        {"content": s("the key insight or discovery to persist"), "kind": s("note, bug_hypothesis, or architecture")}, ["content"]))
+        specs.append(fn("cortex_feedback",
+                        "Rate a recalled note as useful or useless to strengthen or deprioritize it in the Hebbian memory graph.",
+                        {"note_id": i("ID of the note"), "verdict": s("useful or useless")}, ["note_id", "verdict"]))
     specs.append(fn("submit", "Submit your final answer and complete the task: the code locations that must change to fix the issue.",
                     {"locations": {"type": "array", "items": {"type": "object", "properties": {
                         "file": s("repo-relative path"), "start_line": i("first line"),
@@ -344,6 +415,15 @@ def run_episode(llm, repo, workdir, issue, arm, max_steps, logger=None):
             f"\nCortex code index pre-fetched these candidate locations:\n{ctx}\n\n"
             "Examine the top candidate location using read_file. As soon as you confirm the code, "
             "immediately call `submit` with the exact line ranges. Aim to finish in 1-2 turns.\n"
+        )
+    elif use_tool:
+        prompt += (
+            "\nTip: You have access to Cortex codebase intelligence tools:\n"
+            "- `cortex_search`: Semantic search over symbols and past memories (returns file:line ranges + signatures).\n"
+            "- `cortex_find`: Exact AST definition and call-site lookup (pinpoints where a function/class is defined and used).\n"
+            "- `cortex_map`: File roadmaps (entry points, imports, and inbound references).\n"
+            "- `cortex_remember`: Store key architectural discoveries or bug hypotheses in persistent memory for future recall.\n"
+            "Use these tools to locate relevant code rapidly, inspect with `read_file`, and call `submit`.\n"
         )
     msgs.append({"role": "user", "content": prompt})
     specs = tool_specs(use_tool)
@@ -405,7 +485,23 @@ def run_episode(llm, repo, workdir, issue, arm, max_steps, logger=None):
                     out = t_grep(repo, args.get("pattern", ""), args.get("path", "."))
                 elif name == "cortex_search" and use_tool:
                     c0 = time.time()
-                    out = cortex_context(workdir, args.get("query", ""))
+                    out = cortex_context(workdir, args.get("query", ""), budget=int(args.get("budget", 2000)))
+                    cortex_ms += int((time.time() - c0) * 1000)
+                elif name == "cortex_find" and use_tool:
+                    c0 = time.time()
+                    out = cortex_find(workdir, args.get("query", ""), n=int(args.get("n", 10)))
+                    cortex_ms += int((time.time() - c0) * 1000)
+                elif name == "cortex_map" and use_tool:
+                    c0 = time.time()
+                    out = cortex_map(workdir, args.get("query", ""))
+                    cortex_ms += int((time.time() - c0) * 1000)
+                elif name == "cortex_remember" and use_tool:
+                    c0 = time.time()
+                    out = cortex_remember(workdir, args.get("content", ""), kind=args.get("kind", "note"))
+                    cortex_ms += int((time.time() - c0) * 1000)
+                elif name == "cortex_feedback" and use_tool:
+                    c0 = time.time()
+                    out = cortex_feedback(workdir, args.get("note_id", 0), verdict=args.get("verdict", "useful"))
                     cortex_ms += int((time.time() - c0) * 1000)
                 else:
                     out = f"unknown tool {name}"
@@ -422,7 +518,10 @@ def run_episode(llm, repo, workdir, issue, arm, max_steps, logger=None):
             if logger:
                 logger.start_turn(steps + 1)
             msgs.append({"role": "user", "content": "Investigation finished. Call `submit` now with the code locations to fix."})
-            msg = llm.chat(prune_messages(msgs), specs, tool_choice="auto", logger=logger)
+            try:
+                msg = llm.chat(prune_messages(msgs), specs, tool_choice={"type": "function", "function": {"name": "submit"}}, logger=logger)
+            except Exception:
+                msg = llm.chat(prune_messages(msgs), specs, tool_choice="auto", logger=logger)
             steps += 1
             if logger and msg.get("content"):
                 logger.record_model_response(msg.get("content"))
@@ -468,8 +567,15 @@ def run_episode(llm, repo, workdir, issue, arm, max_steps, logger=None):
 
 
 # --------------------------------------------------------------------- scoring
+def _norm_path(p):
+    s = str(p or "").replace("\\", "/").strip()
+    if s.startswith("./"):
+        s = s[2:]
+    return s
+
+
 def score(final, gold):
-    gold_files = {g["file"] for g in gold}
+    gold_files = {_norm_path(g.get("file", "")) for g in gold if isinstance(g, dict)}
     out = {"file_f1": 0.0, "file_recall": 0.0, "span_recall": 0.0,
            "line_recall": 0.0, "line_precision": 0.0, "submitted": bool(final)}
     if not final:
@@ -479,7 +585,7 @@ def score(final, gold):
     elif not isinstance(final, list):
         return out
     preds = [p for p in final if isinstance(p, dict) and p.get("file")]
-    pf = {p["file"] for p in preds}
+    pf = {_norm_path(p["file"]) for p in preds}
     inter = len(pf & gold_files)
     prec, rec = inter / max(1, len(pf)), inter / max(1, len(gold_files))
     out["file_recall"] = round(rec, 3)
@@ -489,15 +595,17 @@ def score(final, gold):
         s = set()
         for sp in spans:
             a, b = int(sp.get("start_line") or 0), int(sp.get("end_line") or 0)
-            if a and b >= a:
-                s.update((sp["file"], n) for n in range(a, min(b, a + 5000) + 1))
+            f = _norm_path(sp.get("file", ""))
+            if a and b >= a and f:
+                s.update((f, n) for n in range(a, min(b, a + 5000) + 1))
         return s
     gl, pl = lines(gold), lines(preds)
     hit = 0                       # strict: a gold span counts only on real line overlap
     for g in gold:
         a, b = g.get("start_line", 0), g.get("end_line", 0)
+        gf = _norm_path(g.get("file", ""))
         for p in preds:
-            if p["file"] == g["file"] and int(p.get("start_line") or 0) <= b and a <= int(p.get("end_line") or 0):
+            if _norm_path(p.get("file", "")) == gf and int(p.get("start_line") or 0) <= b and a <= int(p.get("end_line") or 0):
                 hit += 1
                 break
     out["span_recall"] = round(hit / max(1, len(gold)), 3)
@@ -557,8 +665,10 @@ def main():
     episodes_dir.mkdir(parents=True, exist_ok=True)
     markdown_dir.mkdir(parents=True, exist_ok=True)
 
-    tasks = [json.loads(l) for l in open(f"{a.fixtures}/tasks.jsonl") if l.strip()]
-    random.Random(a.seed).shuffle(tasks)
+    fix_file = a.fixtures if a.fixtures.endswith(".jsonl") else f"{a.fixtures}/tasks.jsonl"
+    tasks = [json.loads(l) for l in open(fix_file) if l.strip()]
+    if a.seed:
+        random.Random(a.seed).shuffle(tasks)
     if a.limit:
         tasks = tasks[:a.limit]
     done = {}
@@ -568,26 +678,42 @@ def main():
             done[r["id"]] = r
     llm = Llm(a.provider, a.model)
     rows = []
+    
+    local_repo_map = {
+        "django/django": str(ROOT / "bench" / "fixtures" / "contextbench_django" / "repos" / "django__django"),
+        "sympy/sympy": str(ROOT / "bench" / "fixtures" / "contextbench_sympy" / "repos" / "sympy__sympy"),
+        "astropy/astropy": str(ROOT / "bench" / "fixtures" / "contextbench_astropy" / "repos" / "astropy__astropy"),
+        "psf/requests": str(ROOT / "bench" / "fixtures" / "repos_cache" / "psf__requests"),
+        "facebook/zstd": str(ROOT / "bench" / "fixtures" / "contextbench_zstd" / "repos" / "facebook__zstd"),
+        "iamkun/dayjs": str(ROOT / "bench" / "fixtures" / "contextbench_dayjs" / "repos" / "iamkun__dayjs"),
+        "clap-rs/clap": str(ROOT / "bench" / "fixtures" / "contextbench_clap" / "repos" / "clap-rs__clap"),
+    }
+    
     with open(a.out, "a") as f:
         for t in tasks:
             if t["instance_id"] in done:
                 rows.append(done[t["instance_id"]])
                 continue
-            gold = json.loads(t["gold_context"])
-            row = {"id": t["instance_id"], "model": a.model, "gold_files": len({g["file"] for g in gold})}
+            raw_gold = t.get("gold_context", "[]")
+            gold = json.loads(raw_gold) if isinstance(raw_gold, str) else raw_gold
+            row = {"id": t["instance_id"], "model": a.model, "gold_files": len({g.get("file","") for g in gold if isinstance(g, dict)})}
             order = arms[:]
             random.Random(__import__("zlib").crc32(t["instance_id"].encode())).shuffle(order)
+            
+            task_repo = local_repo_map.get(t.get("repo"), a.repo)
+            task_workdir = task_repo
+            
             for arm in order:
                 logger = EpisodeLogger(
                     task_id=t["instance_id"],
-                    repo=t.get("repo", Path(a.repo).name),
+                    repo=t.get("repo", Path(task_repo).name),
                     language=t.get("language", "Unknown"),
                     arm=arm,
                     model=a.model,
                     problem_statement=t["problem_statement"],
                     gold_context=gold,
                 )
-                r = run_episode(llm, a.repo, a.workdir, t["problem_statement"], arm, a.max_steps, logger=logger)
+                r = run_episode(llm, task_repo, task_workdir, t["problem_statement"], arm, a.max_steps, logger=logger)
                 sc = score(r["final"], gold)
                 r.update(sc)
                 row[arm] = r

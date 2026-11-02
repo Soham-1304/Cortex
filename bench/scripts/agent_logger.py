@@ -364,8 +364,8 @@ def generate_interactive_html(json_logs_dir, out_html_path):
     <p style="font-size:13px;color:var(--text-muted);margin-top:4px;">Turn-by-turn transparent trace: tool calls, terminal outputs, HTTP 429 rate limit events, and token costs.</p>
   </div>
   <div>
-    <span class="badge" style="background:#1f6feb;color:#fff;font-size:12px;padding:6px 14px;">Model: Google Gemma 4 26B Instruct</span>
-    <span class="badge" style="background:#238636;color:#fff;font-size:12px;padding:6px 14px;margin-left:8px;">14.4K Daily Quota | TPM Flow-Controlled</span>
+    <span class="badge" style="background:#1f6feb;color:#fff;font-size:12px;padding:6px 14px;">Model: Google Gemini Flash</span>
+    <span class="badge" style="background:#238636;color:#fff;font-size:12px;padding:6px 14px;margin-left:8px;">250K TPM Enterprise Quota | Live Multi-Turn Evaluation</span>
   </div>
 </div>
 

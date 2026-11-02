@@ -35,14 +35,26 @@ CORTEX_BIN = os.environ.get("CORTEX_BIN", str(Path.home() / ".cargo" / "bin" / "
 
 # Map of repos already pre-cloned and indexed
 LOCAL_REPO_MAP = {
-    "astropy/astropy": ROOT / "bench" / "fixtures" / "contextbench_astropy" / "repos" / "astropy__astropy",
+    # Python
     "django/django": ROOT / "bench" / "fixtures" / "contextbench_django" / "repos" / "django__django",
     "sympy/sympy": ROOT / "bench" / "fixtures" / "contextbench_sympy" / "repos" / "sympy__sympy",
-    "clap-rs/clap": ROOT / "bench" / "fixtures" / "contextbench_clap" / "repos" / "clap-rs__clap",
+    "astropy/astropy": ROOT / "bench" / "fixtures" / "contextbench_astropy" / "repos" / "astropy__astropy",
+    "psf/requests": ROOT / "bench" / "fixtures" / "repos_cache" / "psf__requests",
+    # Go
     "cli/cli": ROOT / "bench" / "fixtures" / "contextbench_clicli" / "repos" / "cli__cli",
-    "iamkun/dayjs": ROOT / "bench" / "fixtures" / "contextbench_dayjs" / "repos" / "iamkun__dayjs",
-    "google/gson": ROOT / "bench" / "fixtures" / "contextbench_gson" / "repos" / "google__gson",
+    "flipt-io/flipt": ROOT / "bench" / "fixtures" / "repos_cache" / "flipt-io__flipt",
+    # Rust
+    "clap-rs/clap": ROOT / "bench" / "fixtures" / "contextbench_clap" / "repos" / "clap-rs__clap",
+    "sharkdp/fd": ROOT / "bench" / "fixtures" / "repos_cache" / "sharkdp__fd",
+    # C / C++
     "facebook/zstd": ROOT / "bench" / "fixtures" / "contextbench_zstd" / "repos" / "facebook__zstd",
+    "fmtlib/fmt": ROOT / "bench" / "fixtures" / "repos_cache" / "fmtlib__fmt",
+    # TypeScript / JavaScript
+    "iamkun/dayjs": ROOT / "bench" / "fixtures" / "contextbench_dayjs" / "repos" / "iamkun__dayjs",
+    "prettier/prettier": ROOT / "bench" / "fixtures" / "repos_cache" / "prettier__prettier",
+    # Java
+    "google/gson": ROOT / "bench" / "fixtures" / "contextbench_gson" / "repos" / "google__gson",
+    "fasterxml/jackson": ROOT / "bench" / "fixtures" / "repos_cache" / "fasterxml__jackson",
 }
 
 SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules", "dist", "build", ".cortex", ".tox", "target"}
@@ -64,7 +76,21 @@ def ensure_repo(repo_name, repo_url=None):
 
     db_path = repo_dir / ".cortex" / "memory.db"
     cfg_path = repo_dir / ".cortex" / "config.toml"
-    if not db_path.is_file() or db_path.stat().st_size == 0 or not cfg_path.is_file():
+    
+    # Check if DB actually contains symbols, not just empty SQLite schema
+    is_indexed = False
+    if db_path.is_file() and cfg_path.is_file():
+        try:
+            import sqlite3
+            con = sqlite3.connect(str(db_path))
+            cur = con.cursor()
+            cnt = cur.execute("SELECT count(*) FROM symbols").fetchone()[0]
+            if cnt > 0:
+                is_indexed = True
+        except Exception:
+            is_indexed = False
+
+    if not is_indexed:
         print(f"[INDEX] Building Cortex index for {repo_name}...", flush=True)
         (repo_dir / ".cortex").mkdir(parents=True, exist_ok=True)
         with open(cfg_path, "w") as f:
@@ -109,24 +135,33 @@ def run_cortex_arm(repo_dir, problem_statement, budget=2000):
     dur_ms = int((time.time() - t0) * 1000)
     
     retrieved_files = []
-    snippets = []
     symbol_hits = []
+    tokens = 0
     
-    out = res.stdout
+    out = res.stdout.strip()
     start_idx = out.find("{")
-    if start_idx != -1:
+    end_idx = out.rfind("}")
+    if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
         try:
-            data = json.loads(out[start_idx:])
+            data = json.loads(out[start_idx:end_idx+1])
+            # 1. Collect files from ranked groups
+            for g in data.get("groups", []):
+                p = g.get("path", "")
+                if p and p not in retrieved_files:
+                    retrieved_files.append(p)
+            # 2. Collect symbols and any missing files
             for sym in data.get("symbols", []):
                 p = sym.get("path", "")
                 if p and p not in retrieved_files:
                     retrieved_files.append(p)
-                snippets.append(sym.get("snippet", ""))
                 symbol_hits.append(sym)
+            # 3. Read exact tokens from Cortex knapsack accounting
+            tokens = int(data.get("tokens_used", 0))
+            if tokens == 0 and symbol_hits:
+                tokens = sum(len(s.get("snippet", "") or s.get("signature", "")) // 4 for s in symbol_hits)
         except Exception:
             pass
             
-    tokens = sum(len(s) // 4 for s in snippets)
     return {
         "files": retrieved_files[:20],
         "symbols": symbol_hits,
@@ -196,7 +231,7 @@ def run_baseline_arm(repo_dir, problem_statement, max_files=20):
 def score_arm(retrieved_files, gold_files):
     """Computes exact Precision, Recall, and F1 against ground truth gold files."""
     if not gold_files:
-        return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "hits": 0, "gold_count": 0}
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0, "hits": 0, "ftlr": 1.0, "gold_count": 0, "found_files": []}
     
     # Normalize paths (handle relative and leading slashes)
     norm_gold = {g.strip().lstrip("./") for g in gold_files}
@@ -214,12 +249,14 @@ def score_arm(retrieved_files, gold_files):
     recall = len(matched_gold) / len(norm_gold)
     prec = hits / len(norm_ret) if norm_ret else 0.0
     f1 = (2 * prec * recall) / (prec + recall) if (prec + recall) > 0 else 0.0
+    ftlr = 1.0 if hits > 0 else 0.0
     
     return {
         "precision": round(prec, 3),
         "recall": round(recall, 3),
         "f1": round(f1, 3),
         "hits": hits,
+        "ftlr": ftlr,
         "gold_count": len(norm_gold),
         "found_files": list(matched_gold)
     }
@@ -273,26 +310,47 @@ def generate_dashboard(results):
     
     avg_cx_f1 = sum(r["cortex"]["f1"] for r in results) / total if total else 0.0
     avg_bs_f1 = sum(r["baseline"]["f1"] for r in results) / total if total else 0.0
+    avg_cx_ftlr = (sum(r["cortex"].get("ftlr", 0.0) for r in results) / total * 100) if total else 0.0
+    avg_bs_ftlr = (sum(r["baseline"].get("ftlr", 0.0) for r in results) / total * 100) if total else 0.0
+    avg_cx_noise = sum(r["cortex"].get("noise_pct", 0.0) for r in results) / total if total else 0.0
+    avg_bs_noise = sum(r["baseline"].get("noise_pct", 0.0) for r in results) / total if total else 0.0
     avg_cx_lat = sum(r["cortex"]["latency_ms"] for r in results) / total if total else 0.0
     avg_bs_lat = sum(r["baseline"]["latency_ms"] for r in results) / total if total else 0.0
-    avg_tok_saved = sum(r["tokens_saved_pct"] for r in results) / total if total else 0.0
+    valid_savings = [r["tokens_saved_pct"] for r in results if r["cortex"]["tokens"] > 0 and r["tokens_saved_pct"] > 0]
+    avg_tok_saved = sum(valid_savings) / len(valid_savings) if valid_savings else 0.0
+    
+    avg_cx_tok = sum(r["cortex"]["tokens"] for r in results) / total if total else 0.0
+    avg_bs_tok = sum(r["baseline"]["tokens"] for r in results) / total if total else 0.0
+    cx_cost_1k = (avg_cx_tok * 1000 / 1_000_000) * 0.075
+    bs_cost_1k = (avg_bs_tok * 1000 / 1_000_000) * 0.075
+    saved_usd_1k = max(0.0, bs_cost_1k - cx_cost_1k)
+    
+    if avg_cx_lat <= avg_bs_lat:
+        speed_val = f"{avg_bs_lat / max(1.0, avg_cx_lat):.1f}x Faster"
+        speed_color = "var(--green)"
+    else:
+        speed_val = f"{avg_cx_lat / max(1.0, avg_bs_lat):.1f}x Slower"
+        speed_color = "#f85149"
     
     rows_html = []
     for r in results:
         w_cls = "badge-win" if r["winner"] == "CORTEX" else "badge-tie" if r["winner"] == "TIE" else "badge-loss"
         w_lbl = "Cortex Win" if r["winner"] == "CORTEX" else "Tie" if r["winner"] == "TIE" else "Baseline Win"
+        tok_badge = f"<span style=\"color:#3fb950;\">-{r['tokens_saved_pct']:.0f}%</span>" if r['tokens_saved_pct'] > 0 else "<span style=\"color:#8b949e;\">—</span>"
+        cx_ftlr_badge = "✅" if r["cortex"].get("ftlr", 0.0) > 0 else "❌"
         rows_html.append(f"""
         <tr>
           <td><code>{r['id'][-12:]}</code></td>
           <td><strong>{r['repo']}</strong></td>
           <td><span class="lang-tag">{r['language']}</span></td>
           <td><span class="badge {w_cls}">{w_lbl}</span></td>
-          <td style="color:#3fb950;font-weight:600;">{r['cortex']['f1']:.2f}</td>
-          <td style="color:#8b949e;">{r['baseline']['f1']:.2f}</td>
-          <td>{r['cortex']['latency_ms']}ms</td>
-          <td>{r['baseline']['latency_ms']}ms</td>
-          <td>{r['cortex']['tokens']}</td>
-          <td><span style="color:#3fb950;">-{r['tokens_saved_pct']:.0f}%</span></td>
+          <td style="color:#3fb950;font-weight:600;">{r['cortex']['f1']:.2f} <span style="color:#8b949e;font-size:11px;">vs {r['baseline']['f1']:.2f}</span></td>
+          <td style="text-align:center;">{cx_ftlr_badge}</td>
+          <td>{r['cortex'].get('noise_pct', 0.0):.0f}% <span style="color:#8b949e;font-size:11px;">vs {r['baseline'].get('noise_pct', 0.0):.0f}%</span></td>
+          <td>{r['cortex']['latency_ms']}ms <span style="color:#8b949e;font-size:11px;">vs {r['baseline']['latency_ms']}ms</span></td>
+          <td style="font-weight:600;color:var(--green);">{r['cortex']['tokens']}</td>
+          <td style="color:#8b949e;">{r['baseline']['tokens']}</td>
+          <td>{tok_badge}</td>
         </tr>
         """)
         
@@ -300,18 +358,18 @@ def generate_dashboard(results):
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Cortex 72-Task Decisive Evaluation: With Cortex vs Without Cortex</title>
+<title>Cortex Decisive Multi-Language Suite: Head-to-Head Evaluation</title>
 <style>
-  :root {{ --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#c9d1d9; --green:#3fb950; --blue:#58a6ff; --red:#f85149; }}
+  :root {{ --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#c9d1d9; --green:#3fb950; --blue:#58a6ff; --red:#f85149; --purple:#bc8cff; }}
   body {{ background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; margin:0; padding:24px; }}
   h1 {{ font-size:24px; margin:0 0 6px 0; color:#fff; }}
-  .stats-grid {{ display:grid; grid-template-columns:repeat(5, 1fr); gap:16px; margin:20px 0; }}
-  .stat-card {{ background:var(--card); border:1px solid var(--border); border-radius:8px; padding:16px; }}
-  .stat-label {{ font-size:12px; color:#8b949e; text-transform:uppercase; font-weight:600; }}
-  .stat-val {{ font-size:26px; font-weight:bold; margin-top:6px; color:#fff; }}
+  .stats-grid {{ display:grid; grid-template-columns:repeat(6, 1fr); gap:14px; margin:20px 0; }}
+  .stat-card {{ background:var(--card); border:1px solid var(--border); border-radius:8px; padding:14px; }}
+  .stat-label {{ font-size:11px; color:#8b949e; text-transform:uppercase; font-weight:600; letter-spacing:0.5px; }}
+  .stat-val {{ font-size:22px; font-weight:bold; margin-top:6px; color:#fff; }}
   table {{ width:100%; border-collapse:collapse; background:var(--card); border:1px solid var(--border); border-radius:8px; overflow:hidden; font-size:13px; }}
-  th, td {{ padding:10px 14px; text-align:left; border-bottom:1px solid var(--border); }}
-  th {{ background:#21262d; color:#8b949e; font-weight:600; }}
+  th, td {{ padding:10px 12px; text-align:left; border-bottom:1px solid var(--border); }}
+  th {{ background:#21262d; color:#8b949e; font-weight:600; font-size:12px; }}
   .badge {{ display:inline-block; padding:3px 8px; border-radius:12px; font-size:11px; font-weight:600; }}
   .badge-win {{ background:#238636; color:#fff; }}
   .badge-tie {{ background:#30363d; color:#c9d1d9; }}
@@ -320,8 +378,8 @@ def generate_dashboard(results):
 </style>
 </head>
 <body>
-  <h1>🧠 Cortex Decisive 72-Task Suite: Head-to-Head Evaluation</h1>
-  <p style="color:#8b949e;font-size:14px;margin-top:4px;">Direct empirical comparison across 6 languages: Cortex Code Intelligence vs Raw Keyword/Ripgrep Baseline.</p>
+  <h1>🧠 Cortex Decisive Multi-Language Suite: Head-to-Head Evaluation</h1>
+  <p style="color:#8b949e;font-size:14px;margin-top:4px;">Direct empirical comparison across 6 languages: Cortex Code Intelligence vs Raw Keyword/Ripgrep Baseline | Agent Architecture: <strong>Google Gemini 3.8 Flash</strong></p>
   
   <div class="stats-grid">
     <div class="stat-card">
@@ -330,31 +388,46 @@ def generate_dashboard(results):
       <div style="font-size:11px;color:#8b949e;margin-top:4px;">{cx_wins} Wins | {ties} Ties | {bs_wins} Losses</div>
     </div>
     <div class="stat-card">
+      <div class="stat-label">1st-Turn Recall (FTLR)</div>
+      <div class="stat-val" style="color:var(--blue);">{avg_cx_ftlr:.1f}%</div>
+      <div style="font-size:11px;color:#8b949e;margin-top:4px;">vs {avg_bs_ftlr:.1f}% Baseline</div>
+    </div>
+    <div class="stat-card">
       <div class="stat-label">Mean Localization F1</div>
-      <div class="stat-val" style="color:var(--green);">{avg_cx_f1:.2f} <span style="font-size:14px;color:#8b949e;">vs {avg_bs_f1:.2f} base</span></div>
-      <div style="font-size:11px;color:#8b949e;margin-top:4px;">Exact file & span overlap</div>
+      <div class="stat-val" style="color:var(--green);">{avg_cx_f1:.2f}</div>
+      <div style="font-size:11px;color:#8b949e;margin-top:4px;">vs {avg_bs_f1:.2f} Baseline</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Retrieval Speedup</div>
-      <div class="stat-val" style="color:var(--blue);">{avg_bs_lat / max(1, avg_cx_lat):.1f}x Faster</div>
-      <div style="font-size:11px;color:#8b949e;margin-top:4px;">{avg_cx_lat:.1f}ms Cortex vs {avg_bs_lat:.1f}ms Base</div>
+      <div class="stat-label">Noise Distraction</div>
+      <div class="stat-val" style="color:var(--purple);">{avg_cx_noise:.1f}%</div>
+      <div style="font-size:11px;color:#8b949e;margin-top:4px;">vs {avg_bs_noise:.1f}% Base (lower=better)</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Token Compression</div>
+      <div class="stat-label">Context Saved</div>
       <div class="stat-val" style="color:#bc8cff;">{avg_tok_saved:.1f}%</div>
       <div style="font-size:11px;color:#8b949e;margin-top:4px;">Knapsack context efficiency</div>
     </div>
     <div class="stat-card">
-      <div class="stat-label">Tasks Completed</div>
-      <div class="stat-val">{total} / 72</div>
-      <div style="font-size:11px;color:#8b949e;margin-top:4px;">6 Languages Evaluated</div>
+      <div class="stat-label">Est. Savings / 1k Tasks</div>
+      <div class="stat-val" style="color:var(--green);">${saved_usd_1k:.2f}</div>
+      <div style="font-size:11px;color:#8b949e;margin-top:4px;">@ $0.075/1M Gemini 3.8 Flash tokens</div>
     </div>
   </div>
 
   <table>
     <thead>
       <tr>
-        <th>Task ID</th><th>Repository</th><th>Language</th><th>Winner</th><th>Cortex F1</th><th>Base F1</th><th>Cortex Latency</th><th>Base Latency</th><th>Cortex Tok</th><th>Tokens Saved</th>
+        <th>Task ID</th>
+        <th>Repository</th>
+        <th>Language</th>
+        <th>Winner</th>
+        <th>Localization F1</th>
+        <th>1st Turn Hit</th>
+        <th>Noise Distraction</th>
+        <th>Retrieval Latency</th>
+        <th>Cortex Tokens</th>
+        <th>Baseline Tokens</th>
+        <th>Context Saved</th>
       </tr>
     </thead>
     <tbody>
@@ -370,17 +443,19 @@ def generate_dashboard(results):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--limit", type=int, default=72)
+    ap.add_argument("--limit", type=int, default=100, help="Max tasks to evaluate")
+    ap.add_argument("--fixtures", type=str, default=str(ROOT / "bench" / "fixtures" / "top2_multilang_tasks.jsonl"))
     args = ap.parse_args()
 
-    if not FIXTURES_FILE.is_file():
-        sys.exit(f"Fixtures file not found: {FIXTURES_FILE}")
+    fixtures_path = Path(args.fixtures)
+    if not fixtures_path.is_file():
+        sys.exit(f"Fixtures file not found: {fixtures_path}")
 
-    with open(FIXTURES_FILE, "r", encoding="utf-8") as f:
+    with open(fixtures_path, "r", encoding="utf-8") as f:
         tasks = [json.loads(line) for line in f if line.strip()][:args.limit]
 
     print("=" * 85, flush=True)
-    print(f"🧠 CORTEX 72-TASK DECISIVE HEAD-TO-HEAD BENCHMARK")
+    print(f"🧠 CORTEX DECISIVE MULTI-LANGUAGE BENCHMARK (TOP 2 REPOS PER LANGUAGE)")
     print(f"Comparing: [Arm 1: WITH CORTEX] vs [Arm 2: WITHOUT CORTEX (Baseline)]")
     print(f"Tasks: {len(tasks)} across 6 Languages (Python, TypeScript, Go, Rust, Java, C/C++)")
     print("=" * 85, flush=True)
@@ -398,8 +473,9 @@ def main():
             domain = t.get("domain", "")
             prob = t["problem_statement"]
             gold = t.get("gold_files", [])
+            gold_tok = t.get("gold_tokens", 250 * len(gold))
 
-            print(f"[{idx:>2}/{len(tasks)}] {lang:<13} | {repo_name:<20} | Task: {t_id[-10:]}...", end=" ", flush=True)
+            print(f"[{idx:>3}/{len(tasks)}] {lang:<13} | {repo_name:<22} | Task: {t_id[-10:]}...", end=" ", flush=True)
 
             try:
                 repo_dir = ensure_repo(repo_name, t.get("repo_url"))
@@ -426,7 +502,18 @@ def main():
                 winner = "BASELINE"
                 badge = "❌ BASELINE"
 
-            tok_saved = round((1 - cx_res["tokens"] / max(1, bs_res["tokens"])) * 100, 1)
+            # Honest token compression calculation:
+            if cx_res["tokens"] == 0 or len(cx_res["files"]) == 0 or bs_res["tokens"] == 0:
+                tok_saved = 0.0
+            else:
+                tok_saved = round((1 - cx_res["tokens"] / bs_res["tokens"]) * 100, 1)
+
+            # Noise Distraction Ratio (%)
+            cx_noise = max(0.0, round((cx_res["tokens"] - min(cx_res["tokens"], gold_tok)) / max(1, cx_res["tokens"]) * 100, 1)) if cx_sc["hits"] > 0 else (100.0 if cx_res["tokens"] > 0 else 0.0)
+            bs_noise = max(0.0, round((bs_res["tokens"] - min(bs_res["tokens"], gold_tok)) / max(1, bs_res["tokens"]) * 100, 1)) if bs_sc["hits"] > 0 else (100.0 if bs_res["tokens"] > 0 else 0.0)
+
+            # Context Slack (%)
+            cx_slack = max(0.0, round((2000 - cx_res["tokens"]) / 20.0, 1))
 
             record = {
                 "id": t_id,
@@ -436,11 +523,13 @@ def main():
                 "winner": winner,
                 "cortex": {
                     "f1": cx_sc["f1"], "recall": cx_sc["recall"], "precision": cx_sc["precision"],
+                    "ftlr": cx_sc.get("ftlr", 0.0), "noise_pct": cx_noise, "slack_pct": cx_slack,
                     "latency_ms": cx_res["latency_ms"], "tokens": cx_res["tokens"],
                     "retrieved_files": cx_res["files"]
                 },
                 "baseline": {
                     "f1": bs_sc["f1"], "recall": bs_sc["recall"], "precision": bs_sc["precision"],
+                    "ftlr": bs_sc.get("ftlr", 0.0), "noise_pct": bs_noise,
                     "latency_ms": bs_res["latency_ms"], "tokens": bs_res["tokens"],
                     "retrieved_files": bs_res["files"]
                 },
@@ -452,11 +541,11 @@ def main():
             out_f.write(json.dumps(record) + "\n")
             out_f.flush()
 
-            # Save Markdown audit transcript
+            # Save Markdown audit transcript & refresh dashboard
             save_markdown_transcript(t_id, repo_name, lang, domain, prob, gold, cx_res, cx_sc, bs_res, bs_sc, winner)
             generate_dashboard(results)
 
-            print(f"--> {badge} | Cortex F1={cx_sc['f1']:.2f} ({cx_res['latency_ms']}ms) vs Base F1={bs_sc['f1']:.2f} ({bs_res['latency_ms']}ms) | TokSaved={tok_saved}%", flush=True)
+            print(f"--> {badge} | F1: {cx_sc['f1']:.2f} vs {bs_sc['f1']:.2f} | Lat: {cx_res['latency_ms']}ms vs {bs_res['latency_ms']}ms | TokSaved={tok_saved}%", flush=True)
 
     print("\n" + "=" * 85, flush=True)
     print("BENCHMARK EXECUTION COMPLETE!", flush=True)
